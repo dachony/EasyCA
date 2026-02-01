@@ -1,0 +1,28 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    ports:
+      - "8444:8443"
+    volumes:
+      - ca-data:/app/data
+    environment:
+      - CA_ENCRYPTION_KEY=${CA_ENCRYPTION_KEY:-changeme-generate-secure-key}
+      - DATABASE_PATH=/app/data/easyca.db
+      - PORT=8443
+      - GIN_MODE=release
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+    ports:
+      - "9988:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  ca-data:
