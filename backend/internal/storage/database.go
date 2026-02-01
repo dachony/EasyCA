@@ -966,3 +966,39 @@ func (d *Database) ImportCertificate(cert *models.Certificate) error {
 		cert.NotBefore, cert.NotAfter, cert.RevokedAt, cert.RevocationReason, cert.CreatedAt)
 	return err
 }
+
+// DeleteCA deletes a CA and optionally its children
+func (d *Database) DeleteCA(id string, cascade bool) error {
+	if cascade {
+		// Delete all certificates issued by this CA
+		if _, err := d.db.Exec(`DELETE FROM certificates WHERE ca_id = ?`, id); err != nil {
+			return err
+		}
+		// Delete all child CAs (intermediate CAs)
+		if _, err := d.db.Exec(`DELETE FROM certificate_authorities WHERE parent_id = ?`, id); err != nil {
+			return err
+		}
+	}
+	_, err := d.db.Exec(`DELETE FROM certificate_authorities WHERE id = ?`, id)
+	return err
+}
+
+// HasChildCAs checks if a CA has child CAs
+func (d *Database) HasChildCAs(id string) (bool, error) {
+	var count int
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM certificate_authorities WHERE parent_id = ?`, id).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// HasCertificates checks if a CA has issued certificates
+func (d *Database) HasCertificates(id string) (bool, error) {
+	var count int
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM certificates WHERE ca_id = ?`, id).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}

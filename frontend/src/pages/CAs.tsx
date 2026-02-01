@@ -43,6 +43,8 @@ function CAs() {
   const [expandedCAs, setExpandedCAs] = useState<Set<string>>(new Set())
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
+  const [deleteModal, setDeleteModal] = useState<{ ca: CA, hasChildren: boolean, hasCerts: boolean } | null>(null)
+  const [deleteStatus, setDeleteStatus] = useState<FormStatus>(null)
   const [formData, setFormData] = useState({
     name: '',
     common_name: '',
@@ -200,6 +202,34 @@ function CAs() {
     a.click()
   }
 
+  const handleDeleteClick = (ca: CA) => {
+    const hasChildren = cas.some(c => c.parent_id === ca.id)
+    const hasCerts = certs.some(c => c.ca_id === ca.id)
+    setDeleteModal({ ca, hasChildren, hasCerts })
+  }
+
+  const handleDeleteConfirm = async (cascade: boolean) => {
+    if (!deleteModal) return
+    setDeleteStatus(null)
+
+    try {
+      const res = await fetch(`/api/ca/${deleteModal.ca.id}?cascade=${cascade}`, {
+        method: 'DELETE',
+      })
+
+      if (!res.ok) {
+        const data = await res.json()
+        throw new Error(data.error || 'Failed to delete CA')
+      }
+
+      setDeleteModal(null)
+      fetchData()
+      setStatusWithAutoClear({ type: 'success', message: 'CA deleted successfully' })
+    } catch (err) {
+      setDeleteStatus({ type: 'error', message: err instanceof Error ? err.message : 'Error' })
+    }
+  }
+
   const getRowClass = (type: 'root' | 'intermediate' | 'cert') => {
     switch (type) {
       case 'root': return 'row-root'
@@ -250,9 +280,14 @@ function CAs() {
           <td>{formatDNSNames(ca.dns_names)}</td>
           <td>{new Date(ca.not_after).toLocaleDateString()}</td>
           <td onClick={e => e.stopPropagation()}>
-            <button className="btn btn-secondary btn-sm" onClick={() => downloadCA(ca)}>
-              Download
-            </button>
+            <div style={{ display: 'flex', gap: '0.25rem' }}>
+              <button className="btn btn-secondary btn-sm" onClick={() => downloadCA(ca)}>
+                Download
+              </button>
+              <button className="btn btn-danger btn-sm" onClick={() => handleDeleteClick(ca)}>
+                Delete
+              </button>
+            </div>
           </td>
         </tr>
         {isExpanded && childIntermediates.map(intermediate => renderCARow(intermediate, level + 1))}
@@ -403,6 +438,54 @@ function CAs() {
             )}
           </div>
         </>
+      )}
+
+      {deleteModal && (
+        <div className="modal-overlay" onClick={() => setDeleteModal(null)}>
+          <div className="modal" style={{ maxWidth: '500px' }} onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2 className="modal-title">Delete CA</h2>
+              <button className="modal-close" onClick={() => setDeleteModal(null)}>&times;</button>
+            </div>
+            <div style={{ padding: '1rem' }}>
+              <p>Are you sure you want to delete <strong>{deleteModal.ca.name}</strong>?</p>
+              {(deleteModal.hasChildren || deleteModal.hasCerts) && (
+                <div style={{ background: 'var(--warning-bg, #fef3cd)', border: '1px solid var(--warning-border, #ffc107)', borderRadius: '4px', padding: '0.75rem', marginTop: '0.75rem' }}>
+                  <strong>Warning:</strong> This CA has:
+                  <ul style={{ margin: '0.5rem 0 0 1.5rem', padding: 0 }}>
+                    {deleteModal.hasChildren && <li>Child Intermediate CAs</li>}
+                    {deleteModal.hasCerts && <li>Issued certificates</li>}
+                  </ul>
+                  <p style={{ marginTop: '0.5rem', marginBottom: 0 }}>
+                    You can delete only this CA (will fail if it has children) or cascade delete all related items.
+                  </p>
+                </div>
+              )}
+              {deleteStatus && (
+                <div style={{
+                  marginTop: '0.75rem',
+                  padding: '0.5rem 0.75rem',
+                  borderRadius: '4px',
+                  background: deleteStatus.type === 'error' ? 'var(--danger)' : 'var(--success)',
+                  color: 'white',
+                }}>
+                  {deleteStatus.message}
+                </div>
+              )}
+            </div>
+            <div className="modal-actions">
+              <button className="btn btn-secondary" onClick={() => setDeleteModal(null)}>Cancel</button>
+              {(deleteModal.hasChildren || deleteModal.hasCerts) && (
+                <button className="btn btn-danger" onClick={() => handleDeleteConfirm(true)}>
+                  Delete All (Cascade)
+                </button>
+              )}
+              <button className="btn btn-danger" onClick={() => handleDeleteConfirm(false)}>
+                {deleteModal.hasChildren || deleteModal.hasCerts ? 'Delete Only CA' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {showModal && (

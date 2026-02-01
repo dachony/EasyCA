@@ -43,6 +43,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		api.GET("/ca/:id", h.GetCA)
 		api.GET("/ca/:id/download", h.DownloadCA)
 		api.GET("/ca/:id/chain", h.DownloadCAChain)
+		api.DELETE("/ca/:id", h.DeleteCA)
 
 		api.POST("/certificates", h.CreateCertificate)
 		api.POST("/certificates/import", h.ImportCertificate)
@@ -260,6 +261,50 @@ func (h *Handler) GetCA(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, caModel)
+}
+
+func (h *Handler) DeleteCA(c *gin.Context) {
+	id := c.Param("id")
+	cascade := c.Query("cascade") == "true"
+
+	// Check if CA exists
+	_, err := h.db.GetCA(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "CA not found"})
+		return
+	}
+
+	// Check for child CAs
+	hasChildren, err := h.db.HasChildCAs(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check child CAs"})
+		return
+	}
+
+	// Check for issued certificates
+	hasCerts, err := h.db.HasCertificates(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to check certificates"})
+		return
+	}
+
+	if (hasChildren || hasCerts) && !cascade {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":        "CA has child CAs or certificates. Use cascade=true to delete all.",
+			"has_children": hasChildren,
+			"has_certs":    hasCerts,
+		})
+		return
+	}
+
+	if err := h.db.DeleteCA(id, cascade); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete CA"})
+		return
+	}
+
+	h.db.AddAuditLog("delete_ca", "ca", id, "", fmt.Sprintf("Deleted CA (cascade=%v)", cascade))
+
+	c.JSON(http.StatusOK, gin.H{"message": "CA deleted successfully"})
 }
 
 func (h *Handler) CreateCertificate(c *gin.Context) {

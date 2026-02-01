@@ -50,6 +50,7 @@ function Certificates() {
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [expandedCAs, setExpandedCAs] = useState<Set<string>>(new Set())
   const [searchQuery, setSearchQuery] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'valid' | 'expired' | 'revoked'>('all')
   const [formData, setFormData] = useState({
     ca_id: '',
     common_name: '',
@@ -315,18 +316,64 @@ function Certificates() {
   }
 
   const getIntermediateCAs = (parentId: string) => cas.filter(c => c.type === 'intermediate' && c.parent_id === parentId)
-  const getCertificates = (caId: string) => certs.filter(c => c.ca_id === caId)
+
+  const getCertificateStatus = (cert: Certificate) => {
+    if (cert.revoked_at) return 'revoked'
+    if (new Date(cert.not_after) < new Date()) return 'expired'
+    return 'valid'
+  }
+
+  const getCertificates = (caId: string) => {
+    return certs.filter(c => {
+      if (c.ca_id !== caId) return false
+      if (statusFilter === 'all') return true
+      return getCertificateStatus(c) === statusFilter
+    })
+  }
 
   // Filter logic
   const filteredRootCAs = useMemo(() => {
     const query = searchQuery.toLowerCase().trim()
-    if (!query) return cas.filter(c => c.type === 'root')
+
+    // Filter certs by status first
+    const filteredCerts = statusFilter === 'all'
+      ? certs
+      : certs.filter(c => getCertificateStatus(c) === statusFilter)
+
+    // If no search query, just filter by status
+    if (!query) {
+      // Find CAs that have matching certificates
+      const casWithCerts = new Set<string>()
+      filteredCerts.forEach(cert => {
+        let ca = cas.find(c => c.id === cert.ca_id)
+        while (ca) {
+          casWithCerts.add(ca.id)
+          if (ca.parent_id) {
+            ca = cas.find(c => c.id === ca!.parent_id)
+          } else {
+            break
+          }
+        }
+      })
+
+      // If filter is active but no certs match, show empty
+      if (statusFilter !== 'all' && filteredCerts.length === 0) {
+        return []
+      }
+
+      // If filter is active, only show CAs with matching certs
+      if (statusFilter !== 'all') {
+        return cas.filter(c => c.type === 'root' && casWithCerts.has(c.id))
+      }
+
+      return cas.filter(c => c.type === 'root')
+    }
 
     const matchingCAIds = new Set<string>()
     const matchingCertCAIds = new Set<string>()
 
-    // Check certificates
-    certs.forEach(cert => {
+    // Check certificates (only filtered ones)
+    filteredCerts.forEach(cert => {
       const matches =
         cert.common_name.toLowerCase().includes(query) ||
         (cert.organization?.toLowerCase().includes(query)) ||
@@ -372,7 +419,7 @@ function Certificates() {
     }
 
     return cas.filter(c => c.type === 'root' && matchingCAIds.has(c.id))
-  }, [cas, certs, searchQuery])
+  }, [cas, certs, searchQuery, statusFilter])
 
   const formatDNSNames = (dnsNames?: string[]) => {
     if (!dnsNames || dnsNames.length === 0) return '-'
@@ -587,7 +634,7 @@ function Certificates() {
 
           {/* Toolbar */}
           <div className="toolbar">
-            <div className="toolbar-search">
+            <div className="toolbar-search" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
               <div className="form-group" style={{ marginBottom: 0 }}>
                 <input
                   type="text"
@@ -597,6 +644,16 @@ function Certificates() {
                   style={{ paddingLeft: '2.5rem' }}
                 />
               </div>
+              <select
+                value={statusFilter}
+                onChange={e => setStatusFilter(e.target.value as typeof statusFilter)}
+                style={{ padding: '0.5rem', borderRadius: '4px', border: '1px solid var(--border)' }}
+              >
+                <option value="all">All Status</option>
+                <option value="valid">Valid Only</option>
+                <option value="expired">Expired Only</option>
+                <option value="revoked">Revoked Only</option>
+              </select>
             </div>
             <div className="legend">
               <div className="legend-item">
