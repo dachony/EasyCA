@@ -189,6 +189,28 @@ func (d *Database) migrate() error {
 	INSERT OR IGNORE INTO time_settings (id, time_source, ntp_server, timezone)
 	VALUES (1, 'host', 'pool.ntp.org', 'UTC');
 
+	-- Auto-renewal settings
+	CREATE TABLE IF NOT EXISTS auto_renew (
+		certificate_id TEXT PRIMARY KEY,
+		enabled INTEGER DEFAULT 0,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	-- Users
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		username TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		role TEXT DEFAULT 'viewer',
+		full_name TEXT DEFAULT '',
+		email TEXT DEFAULT '',
+		active INTEGER DEFAULT 1,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username);
+
 	-- Certificate templates
 	CREATE TABLE IF NOT EXISTS certificate_templates (
 		id TEXT PRIMARY KEY,
@@ -1141,4 +1163,113 @@ func (d *Database) UpdateTemplate(t *models.CertificateTemplate) error {
 func (d *Database) DeleteTemplate(id string) error {
 	_, err := d.db.Exec(`DELETE FROM certificate_templates WHERE id = ?`, id)
 	return err
+}
+
+// User Methods
+
+func (d *Database) CreateUser(user *models.User) error {
+	_, err := d.db.Exec(`
+		INSERT INTO users (id, username, password_hash, role, full_name, email, active, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		user.ID, user.Username, user.PasswordHash, user.Role, user.FullName, user.Email,
+		user.Active, user.CreatedAt, user.UpdatedAt,
+	)
+	return err
+}
+
+func (d *Database) GetUserByUsername(username string) (*models.User, error) {
+	u := &models.User{}
+	err := d.db.QueryRow(`
+		SELECT id, username, password_hash, role, full_name, email, active, created_at, updated_at
+		FROM users WHERE username = ?`, username,
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.FullName, &u.Email,
+		&u.Active, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+func (d *Database) GetUserByID(id string) (*models.User, error) {
+	u := &models.User{}
+	err := d.db.QueryRow(`
+		SELECT id, username, password_hash, role, full_name, email, active, created_at, updated_at
+		FROM users WHERE id = ?`, id,
+	).Scan(&u.ID, &u.Username, &u.PasswordHash, &u.Role, &u.FullName, &u.Email,
+		&u.Active, &u.CreatedAt, &u.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+func (d *Database) ListUsers() ([]models.User, error) {
+	rows, err := d.db.Query(`
+		SELECT id, username, role, full_name, email, active, created_at, updated_at
+		FROM users ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var users []models.User
+	for rows.Next() {
+		u := models.User{}
+		if err := rows.Scan(&u.ID, &u.Username, &u.Role, &u.FullName, &u.Email,
+			&u.Active, &u.CreatedAt, &u.UpdatedAt); err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	return users, nil
+}
+
+func (d *Database) UpdateUser(user *models.User) error {
+	_, err := d.db.Exec(`
+		UPDATE users SET role = ?, full_name = ?, email = ?, active = ?, updated_at = ?
+		WHERE id = ?`,
+		user.Role, user.FullName, user.Email, user.Active, user.UpdatedAt, user.ID,
+	)
+	return err
+}
+
+func (d *Database) UpdateUserPassword(id string, passwordHash string) error {
+	_, err := d.db.Exec(`UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?`,
+		passwordHash, time.Now(), id)
+	return err
+}
+
+func (d *Database) DeleteUser(id string) error {
+	_, err := d.db.Exec(`DELETE FROM users WHERE id = ?`, id)
+	return err
+}
+
+func (d *Database) CountUsers() (int, error) {
+	var count int
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&count)
+	return count, err
+}
+
+// Auto-renewal Methods
+
+func (d *Database) IsAutoRenewEnabled(certID string) bool {
+	var enabled int
+	err := d.db.QueryRow(`SELECT enabled FROM auto_renew WHERE certificate_id = ?`, certID).Scan(&enabled)
+	return err == nil && enabled == 1
+}
+
+func (d *Database) SetAutoRenew(certID string, enabled bool) error {
+	val := 0
+	if enabled {
+		val = 1
+	}
+	_, err := d.db.Exec(`
+		INSERT INTO auto_renew (certificate_id, enabled) VALUES (?, ?)
+		ON CONFLICT(certificate_id) DO UPDATE SET enabled = ?`,
+		certID, val, val)
+	return err
+}
+
+func (d *Database) GetAutoRenewStatus(certID string) bool {
+	return d.IsAutoRenewEnabled(certID)
 }

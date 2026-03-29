@@ -11,10 +11,13 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/dachony/easyca/internal/auth"
 	"github.com/dachony/easyca/internal/backup"
 	"github.com/dachony/easyca/internal/ca"
+	"github.com/dachony/easyca/internal/middleware"
 	"github.com/dachony/easyca/internal/models"
 	"github.com/dachony/easyca/internal/smtp"
 	"github.com/dachony/easyca/internal/storage"
@@ -28,16 +31,50 @@ type Handler struct {
 	db          *storage.Database
 	caService   *ca.CAService
 	smtpService *smtp.SMTPService
+	authService *auth.AuthService
 }
 
-func NewHandler(db *storage.Database, encryptionKey []byte) *Handler {
+func NewHandler(db *storage.Database, encryptionKey []byte, jwtSecret string) *Handler {
 	h := &Handler{
 		db:          db,
 		caService:   ca.NewCAService(encryptionKey),
 		smtpService: smtp.NewSMTPService(encryptionKey),
+		authService: auth.NewAuthService(jwtSecret),
 	}
 	h.configureTimeFunc()
+	h.ensureDefaultAdmin()
 	return h
+}
+
+// ensureDefaultAdmin creates a default admin user if no users exist
+func (h *Handler) ensureDefaultAdmin() {
+	count, err := h.db.CountUsers()
+	if err != nil || count > 0 {
+		return
+	}
+
+	hash, err := auth.HashPassword("admin123")
+	if err != nil {
+		log.Printf("[AUTH] Failed to create default admin: %v", err)
+		return
+	}
+
+	user := &models.User{
+		ID:           uuid.New().String(),
+		Username:     "admin",
+		PasswordHash: hash,
+		Role:         models.UserRoleAdmin,
+		FullName:     "Administrator",
+		Active:       true,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+
+	if err := h.db.CreateUser(user); err != nil {
+		log.Printf("[AUTH] Failed to create default admin: %v", err)
+		return
+	}
+	log.Println("[AUTH] Default admin user created (username: admin, password: admin123)")
 }
 
 // configureTimeFunc reads time settings from DB and configures CAService's time function
@@ -206,73 +243,106 @@ func (h *Handler) getDefaultValidityDays(forCA bool) int {
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
+	authMW := middleware.AuthMiddleware(h.authService)
+	requireAdmin := middleware.RequireRole(models.UserRoleAdmin)
+	requireOperator := middleware.RequireRole(models.UserRoleAdmin, models.UserRoleOperator)
+
 	api := r.Group("/api")
 	{
-		api.POST("/ca/root", h.CreateRootCA)
-		api.POST("/ca/intermediate", h.CreateIntermediateCA)
-		api.GET("/ca", h.ListCAs)
-		api.GET("/ca/:id", h.GetCA)
-		api.GET("/ca/:id/download", h.DownloadCA)
-		api.GET("/ca/:id/chain", h.DownloadCAChain)
-		api.DELETE("/ca/:id", h.DeleteCA)
+		// Public auth endpoints
+		api.POST("/auth/login", h.Login)
+		api.POST("/auth/register", h.Register)
+		api.GET("/auth/check", h.AuthCheck)
 
-		api.POST("/certificates", h.CreateCertificate)
-		api.POST("/certificates/import", h.ImportCertificate)
-		api.GET("/certificates", h.ListCertificates)
-		api.GET("/certificates/:id", h.GetCertificate)
-		api.DELETE("/certificates/:id", h.DeleteCertificate)
-		api.POST("/certificates/:id/revoke", h.RevokeCertificate)
-		api.GET("/certificates/:id/download", h.DownloadCertificate)
-		api.GET("/certificates/:id/chain", h.DownloadCertificateChain)
-		api.POST("/certificates/:id/export/pkcs12", h.ExportPKCS12)
-		api.GET("/certificates/:id/export/pkcs7", h.ExportPKCS7)
+		// Protected endpoints - all require authentication
+		protected := api.Group("")
+		protected.Use(authMW)
+		{
+			// Auth management
+			protected.GET("/auth/me", h.GetCurrentUser)
+			protected.POST("/auth/change-password", h.ChangePassword)
 
-		// CSR endpoints
-		api.POST("/csr/generate", h.GenerateCSR)
-		api.POST("/csr/import", h.ImportCSR)
-		api.GET("/csr", h.ListCSRs)
-		api.GET("/csr/:id", h.GetCSR)
-		api.GET("/csr/:id/download", h.DownloadCSR)
-		api.POST("/csr/:id/sign", h.SignCSR)
-		api.DELETE("/csr/:id", h.DeleteCSR)
+			// User management (admin only)
+			protected.GET("/users", requireAdmin, h.ListUsers)
+			protected.PUT("/users/:id", requireAdmin, h.UpdateUser)
+			protected.DELETE("/users/:id", requireAdmin, h.DeleteUser)
 
-		// Settings endpoints
-		api.GET("/settings/smtp", h.GetSMTPConfig)
-		api.POST("/settings/smtp", h.SaveSMTPConfig)
-		api.POST("/settings/smtp/test", h.TestSMTP)
-		api.GET("/settings/notifications", h.GetNotificationSettings)
-		api.POST("/settings/notifications", h.SaveNotificationSettings)
-		api.GET("/settings/defaults", h.GetDefaultSettings)
-		api.POST("/settings/defaults", h.SaveDefaultSettings)
-		api.GET("/settings/time", h.GetTimeSettings)
-		api.POST("/settings/time", h.SaveTimeSettings)
-		api.GET("/settings/time/current", h.GetCurrentTime)
+			// CA - viewers can read, operators+ can write
+			protected.GET("/ca", h.ListCAs)
+			protected.GET("/ca/:id", h.GetCA)
+			protected.GET("/ca/:id/download", h.DownloadCA)
+			protected.GET("/ca/:id/chain", h.DownloadCAChain)
+			protected.POST("/ca/root", requireOperator, h.CreateRootCA)
+			protected.POST("/ca/intermediate", requireOperator, h.CreateIntermediateCA)
+			protected.DELETE("/ca/:id", requireAdmin, h.DeleteCA)
 
-		// Recipients endpoints
-		api.GET("/recipients", h.ListRecipients)
-		api.POST("/recipients", h.AddRecipient)
-		api.DELETE("/recipients/:id", h.DeleteRecipient)
+			// Certificates - viewers can read, operators+ can write
+			protected.GET("/certificates", h.ListCertificates)
+			protected.GET("/certificates/:id", h.GetCertificate)
+			protected.GET("/certificates/:id/download", h.DownloadCertificate)
+			protected.GET("/certificates/:id/chain", h.DownloadCertificateChain)
+			protected.POST("/certificates/:id/export/pkcs12", h.ExportPKCS12)
+			protected.GET("/certificates/:id/export/pkcs7", h.ExportPKCS7)
+			protected.POST("/certificates", requireOperator, h.CreateCertificate)
+			protected.POST("/certificates/import", requireOperator, h.ImportCertificate)
+			protected.POST("/certificates/:id/revoke", requireOperator, h.RevokeCertificate)
+			protected.POST("/certificates/bulk/revoke", requireOperator, h.BulkRevokeCertificates)
+			protected.POST("/certificates/bulk/export", h.BulkExportCertificates)
+			protected.POST("/certificates/bulk/delete", requireAdmin, h.BulkDeleteCertificates)
+			protected.POST("/certificates/:id/auto-renew", requireOperator, h.SetAutoRenew)
+			protected.GET("/certificates/:id/auto-renew", h.GetAutoRenew)
+			protected.DELETE("/certificates/:id", requireAdmin, h.DeleteCertificate)
 
-		// Notification log
-		api.GET("/notifications/log", h.GetNotificationLogs)
+			// CSR endpoints
+			protected.GET("/csr", h.ListCSRs)
+			protected.GET("/csr/:id", h.GetCSR)
+			protected.GET("/csr/:id/download", h.DownloadCSR)
+			protected.POST("/csr/generate", requireOperator, h.GenerateCSR)
+			protected.POST("/csr/import", requireOperator, h.ImportCSR)
+			protected.POST("/csr/:id/sign", requireOperator, h.SignCSR)
+			protected.DELETE("/csr/:id", requireOperator, h.DeleteCSR)
 
-		api.POST("/convert", h.ConvertCertificate)
-		api.POST("/analyze", h.AnalyzeCertificate)
+			// Settings - admin only for writes
+			protected.GET("/settings/smtp", h.GetSMTPConfig)
+			protected.POST("/settings/smtp", requireAdmin, h.SaveSMTPConfig)
+			protected.POST("/settings/smtp/test", requireAdmin, h.TestSMTP)
+			protected.GET("/settings/notifications", h.GetNotificationSettings)
+			protected.POST("/settings/notifications", requireAdmin, h.SaveNotificationSettings)
+			protected.GET("/settings/defaults", h.GetDefaultSettings)
+			protected.POST("/settings/defaults", requireAdmin, h.SaveDefaultSettings)
+			protected.GET("/settings/time", h.GetTimeSettings)
+			protected.POST("/settings/time", requireAdmin, h.SaveTimeSettings)
+			protected.GET("/settings/time/current", h.GetCurrentTime)
 
-		// Template endpoints
-		api.POST("/templates", h.CreateTemplate)
-		api.GET("/templates", h.ListTemplates)
-		api.GET("/templates/:id", h.GetTemplate)
-		api.PUT("/templates/:id", h.UpdateTemplate)
-		api.DELETE("/templates/:id", h.DeleteTemplate)
+			// Recipients
+			protected.GET("/recipients", h.ListRecipients)
+			protected.POST("/recipients", requireAdmin, h.AddRecipient)
+			protected.DELETE("/recipients/:id", requireAdmin, h.DeleteRecipient)
 
-		api.GET("/audit", h.GetAuditLogs)
+			// Notification log
+			protected.GET("/notifications/log", h.GetNotificationLogs)
 
-		// Backup endpoints
-		api.POST("/backup/export", h.ExportBackup)
-		api.POST("/backup/import", h.ImportBackup)
+			// Tools
+			protected.POST("/convert", h.ConvertCertificate)
+			protected.POST("/analyze", h.AnalyzeCertificate)
+
+			// Templates
+			protected.GET("/templates", h.ListTemplates)
+			protected.GET("/templates/:id", h.GetTemplate)
+			protected.POST("/templates", requireOperator, h.CreateTemplate)
+			protected.PUT("/templates/:id", requireOperator, h.UpdateTemplate)
+			protected.DELETE("/templates/:id", requireOperator, h.DeleteTemplate)
+
+			// Audit
+			protected.GET("/audit", h.GetAuditLogs)
+
+			// Backup (admin only)
+			protected.POST("/backup/export", requireAdmin, h.ExportBackup)
+			protected.POST("/backup/import", requireAdmin, h.ImportBackup)
+		}
 	}
 
+	// Public PKI endpoints (no auth needed)
 	r.GET("/crl/:ca_id", h.GetCRL)
 	r.POST("/ocsp/:ca_id", h.HandleOCSP)
 	r.GET("/health", h.HealthCheck)
@@ -280,6 +350,405 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 func (h *Handler) HealthCheck(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// Auth Handlers
+
+func (h *Handler) Login(c *gin.Context) {
+	var req models.LoginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	user, err := h.db.GetUserByUsername(req.Username)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+		return
+	}
+
+	if !user.Active {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "account is disabled"})
+		return
+	}
+
+	if !auth.CheckPassword(req.Password, user.PasswordHash) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
+		return
+	}
+
+	token, err := h.authService.GenerateToken(user.ID, user.Username, string(user.Role))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token"})
+		return
+	}
+
+	h.db.AddAuditLog("login", "user", user.ID, user.ID, fmt.Sprintf("User %s logged in", user.Username))
+
+	c.JSON(http.StatusOK, models.LoginResponse{
+		Token: token,
+		User:  *user,
+	})
+}
+
+func (h *Handler) Register(c *gin.Context) {
+	var req models.RegisterRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Check if registration is allowed (only if no users exist, or by admin)
+	count, _ := h.db.CountUsers()
+	role := models.UserRoleViewer
+
+	if count == 0 {
+		role = models.UserRoleAdmin
+	} else {
+		// Only admins can register new users after initial setup
+		header := c.GetHeader("Authorization")
+		if header == "" {
+			c.JSON(http.StatusForbidden, gin.H{"error": "registration requires admin authorization"})
+			return
+		}
+		parts := strings.SplitN(header, " ", 2)
+		if len(parts) == 2 {
+			claims, err := h.authService.ValidateToken(parts[1])
+			if err != nil || claims.Role != string(models.UserRoleAdmin) {
+				c.JSON(http.StatusForbidden, gin.H{"error": "only admins can register new users"})
+				return
+			}
+		} else {
+			c.JSON(http.StatusForbidden, gin.H{"error": "registration requires admin authorization"})
+			return
+		}
+	}
+
+	// Check username uniqueness
+	if _, err := h.db.GetUserByUsername(req.Username); err == nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "username already exists"})
+		return
+	}
+
+	hash, err := auth.HashPassword(req.Password)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+		return
+	}
+
+	user := &models.User{
+		ID:           uuid.New().String(),
+		Username:     req.Username,
+		PasswordHash: hash,
+		Role:         role,
+		FullName:     req.FullName,
+		Email:        req.Email,
+		Active:       true,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+
+	if err := h.db.CreateUser(user); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create user"})
+		return
+	}
+
+	h.db.AddAuditLog("register_user", "user", user.ID, "", fmt.Sprintf("User %s registered with role %s", user.Username, role))
+
+	c.JSON(http.StatusCreated, user)
+}
+
+func (h *Handler) AuthCheck(c *gin.Context) {
+	header := c.GetHeader("Authorization")
+	if header == "" {
+		// Check if any users exist
+		count, _ := h.db.CountUsers()
+		c.JSON(http.StatusOK, gin.H{"authenticated": false, "setup_required": count == 0})
+		return
+	}
+
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) != 2 {
+		c.JSON(http.StatusOK, gin.H{"authenticated": false})
+		return
+	}
+
+	claims, err := h.authService.ValidateToken(parts[1])
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"authenticated": false})
+		return
+	}
+
+	user, err := h.db.GetUserByID(claims.UserID)
+	if err != nil || !user.Active {
+		c.JSON(http.StatusOK, gin.H{"authenticated": false})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"authenticated": true, "user": user})
+}
+
+func (h *Handler) GetCurrentUser(c *gin.Context) {
+	userID, _ := c.Get("userID")
+	user, err := h.db.GetUserByID(userID.(string))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+	c.JSON(http.StatusOK, user)
+}
+
+func (h *Handler) ChangePassword(c *gin.Context) {
+	var req models.ChangePasswordRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	userID, _ := c.Get("userID")
+	user, err := h.db.GetUserByID(userID.(string))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	if !auth.CheckPassword(req.OldPassword, user.PasswordHash) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "current password is incorrect"})
+		return
+	}
+
+	hash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+		return
+	}
+
+	if err := h.db.UpdateUserPassword(user.ID, hash); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update password"})
+		return
+	}
+
+	h.db.AddAuditLog("change_password", "user", user.ID, user.ID, "Password changed")
+	c.JSON(http.StatusOK, gin.H{"message": "password changed"})
+}
+
+// User Management Handlers (admin only)
+
+func (h *Handler) ListUsers(c *gin.Context) {
+	users, err := h.db.ListUsers()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if users == nil {
+		users = []models.User{}
+	}
+	c.JSON(http.StatusOK, users)
+}
+
+func (h *Handler) UpdateUser(c *gin.Context) {
+	id := c.Param("id")
+
+	user, err := h.db.GetUserByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	var req models.UpdateUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.Role != "" {
+		user.Role = req.Role
+	}
+	if req.FullName != "" {
+		user.FullName = req.FullName
+	}
+	if req.Email != "" {
+		user.Email = req.Email
+	}
+	if req.Active != nil {
+		user.Active = *req.Active
+	}
+	user.UpdatedAt = time.Now()
+
+	if err := h.db.UpdateUser(user); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update user"})
+		return
+	}
+
+	adminID, _ := c.Get("userID")
+	h.db.AddAuditLog("update_user", "user", id, adminID.(string),
+		fmt.Sprintf("Updated user %s: role=%s active=%v", user.Username, user.Role, user.Active))
+
+	c.JSON(http.StatusOK, user)
+}
+
+func (h *Handler) DeleteUser(c *gin.Context) {
+	id := c.Param("id")
+
+	// Prevent self-deletion
+	currentID, _ := c.Get("userID")
+	if id == currentID.(string) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot delete your own account"})
+		return
+	}
+
+	user, err := h.db.GetUserByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	if err := h.db.DeleteUser(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete user"})
+		return
+	}
+
+	adminID, _ := c.Get("userID")
+	h.db.AddAuditLog("delete_user", "user", id, adminID.(string),
+		fmt.Sprintf("Deleted user: %s", user.Username))
+
+	c.JSON(http.StatusOK, gin.H{"message": "user deleted"})
+}
+
+// Auto-Renew Handlers
+
+func (h *Handler) SetAutoRenew(c *gin.Context) {
+	id := c.Param("id")
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if _, err := h.db.GetCertificate(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "certificate not found"})
+		return
+	}
+
+	if err := h.db.SetAutoRenew(id, req.Enabled); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update auto-renew"})
+		return
+	}
+
+	action := "disabled"
+	if req.Enabled {
+		action = "enabled"
+	}
+	h.db.AddAuditLog("set_auto_renew", "certificate", id, "", fmt.Sprintf("Auto-renew %s", action))
+	c.JSON(http.StatusOK, gin.H{"enabled": req.Enabled})
+}
+
+func (h *Handler) GetAutoRenew(c *gin.Context) {
+	id := c.Param("id")
+	enabled := h.db.GetAutoRenewStatus(id)
+	c.JSON(http.StatusOK, gin.H{"enabled": enabled})
+}
+
+// Bulk Operations Handlers
+
+func (h *Handler) BulkRevokeCertificates(c *gin.Context) {
+	var req struct {
+		IDs    []string `json:"ids" binding:"required"`
+		Reason string   `json:"reason"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	reason := req.Reason
+	if reason == "" {
+		reason = "unspecified"
+	}
+
+	revoked := 0
+	failed := 0
+	for _, id := range req.IDs {
+		if err := h.db.RevokeCertificate(id, reason); err != nil {
+			failed++
+			continue
+		}
+		h.db.AddAuditLog("revoke_certificate", "certificate", id, "", fmt.Sprintf("Bulk revoked, reason: %s", reason))
+		revoked++
+	}
+
+	c.JSON(http.StatusOK, gin.H{"revoked": revoked, "failed": failed})
+}
+
+func (h *Handler) BulkExportCertificates(c *gin.Context) {
+	var req struct {
+		IDs    []string `json:"ids" binding:"required"`
+		Format string   `json:"format"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	format := req.Format
+	if format == "" {
+		format = "pem"
+	}
+
+	var results []gin.H
+	for _, id := range req.IDs {
+		certModel, err := h.db.GetCertificate(id)
+		if err != nil {
+			continue
+		}
+
+		cert, err := parseRawCert(certModel.Certificate)
+		if err != nil {
+			continue
+		}
+
+		entry := gin.H{
+			"id":          certModel.ID,
+			"common_name": certModel.CommonName,
+		}
+
+		switch format {
+		case "pem":
+			entry["certificate_pem"] = string(ca.CertToPEM(cert))
+		case "der":
+			entry["certificate_der"] = base64.StdEncoding.EncodeToString(cert.Raw)
+		}
+
+		results = append(results, entry)
+	}
+
+	c.JSON(http.StatusOK, results)
+}
+
+func (h *Handler) BulkDeleteCertificates(c *gin.Context) {
+	var req struct {
+		IDs    []string `json:"ids" binding:"required"`
+		Reason string   `json:"reason" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	deleted := 0
+	failed := 0
+	for _, id := range req.IDs {
+		if err := h.db.DeleteCertificate(id); err != nil {
+			failed++
+			continue
+		}
+		h.db.AddAuditLog("delete_certificate", "certificate", id, "", fmt.Sprintf("Bulk deleted, reason: %s", req.Reason))
+		deleted++
+	}
+
+	c.JSON(http.StatusOK, gin.H{"deleted": deleted, "failed": failed})
 }
 
 func (h *Handler) CreateRootCA(c *gin.Context) {

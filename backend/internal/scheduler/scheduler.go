@@ -1,26 +1,32 @@
 package scheduler
 
 import (
+	"crypto/x509"
+	"fmt"
 	"log"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/dachony/easyca/internal/ca"
 	"github.com/dachony/easyca/internal/models"
 	"github.com/dachony/easyca/internal/smtp"
 	"github.com/dachony/easyca/internal/storage"
+	"github.com/google/uuid"
 )
 
 type Scheduler struct {
 	db          *storage.Database
 	smtpService *smtp.SMTPService
+	caService   *ca.CAService
 	stopChan    chan struct{}
 }
 
-func NewScheduler(db *storage.Database, smtpService *smtp.SMTPService) *Scheduler {
+func NewScheduler(db *storage.Database, smtpService *smtp.SMTPService, caService *ca.CAService) *Scheduler {
 	return &Scheduler{
 		db:          db,
 		smtpService: smtpService,
+		caService:   caService,
 		stopChan:    make(chan struct{}),
 	}
 }
@@ -40,8 +46,9 @@ func (s *Scheduler) Stop() {
 func (s *Scheduler) run() {
 	// Run immediately on startup
 	s.checkExpiringCertificates()
+	s.checkAutoRenewals()
 
-	// Then run daily at midnight
+	// Then run daily
 	ticker := time.NewTicker(24 * time.Hour)
 	defer ticker.Stop()
 
@@ -49,6 +56,7 @@ func (s *Scheduler) run() {
 		select {
 		case <-ticker.C:
 			s.checkExpiringCertificates()
+			s.checkAutoRenewals()
 		case <-s.stopChan:
 			return
 		}
@@ -258,6 +266,125 @@ func (s *Scheduler) alreadySentNotification(entityID, notificationType string, d
 	}
 
 	return false
+}
+
+// checkAutoRenewals finds certificates expiring within 30 days that have auto-renewal enabled
+func (s *Scheduler) checkAutoRenewals() {
+	log.Println("Running auto-renewal check...")
+
+	// Get certificates expiring within 30 days
+	certs, err := s.db.GetExpiringCertificates(30)
+	if err != nil {
+		log.Printf("[AUTO-RENEW] Failed to get expiring certificates: %v", err)
+		return
+	}
+
+	renewed := 0
+	for _, cert := range certs {
+		// Skip revoked certificates
+		if cert.RevokedAt != nil {
+			continue
+		}
+
+		// Check if auto-renewal is enabled for this certificate
+		if !s.db.IsAutoRenewEnabled(cert.ID) {
+			continue
+		}
+
+		// Check if already renewed recently
+		if s.alreadySentNotification(cert.ID, "auto_renewed", 0) {
+			continue
+		}
+
+		// Get CA
+		caModel, err := s.db.GetCA(cert.CAID)
+		if err != nil {
+			log.Printf("[AUTO-RENEW] CA not found for cert %s: %v", cert.CommonName, err)
+			continue
+		}
+
+		// Parse CA cert and key
+		caCert, err := x509.ParseCertificate(caModel.Certificate)
+		if err != nil {
+			log.Printf("[AUTO-RENEW] Failed to parse CA cert: %v", err)
+			continue
+		}
+
+		caKey, err := s.caService.DecryptPrivateKey(caModel.PrivateKeyEncrypted)
+		if err != nil {
+			log.Printf("[AUTO-RENEW] Failed to decrypt CA key: %v", err)
+			continue
+		}
+
+		// Calculate new validity (same duration as original)
+		originalDays := int(cert.NotAfter.Sub(cert.NotBefore).Hours() / 24)
+		if originalDays <= 0 {
+			originalDays = 365
+		}
+
+		// Create renewal request
+		req := &models.CreateCertificateRequest{
+			CAID:         cert.CAID,
+			Type:         cert.Type,
+			ValidityDays: originalDays,
+			DNSNames:     cert.DNSNames,
+			KeyAlgorithm: cert.KeyAlgorithm,
+		}
+		req.CommonName = cert.CommonName
+		req.Organization = cert.Organization
+
+		// Generate new certificate
+		newCert, _, err := s.caService.GenerateCertificate(req, caCert, caKey)
+		if err != nil {
+			log.Printf("[AUTO-RENEW] Failed to generate renewed cert for %s: %v", cert.CommonName, err)
+			continue
+		}
+
+		// Save renewed certificate
+		certModel := &models.Certificate{
+			ID:           uuid.New().String(),
+			SerialNumber: newCert.SerialNumber.String(),
+			CAID:         cert.CAID,
+			CommonName:   cert.CommonName,
+			Organization: cert.Organization,
+			DNSNames:     cert.DNSNames,
+			KeyAlgorithm: cert.KeyAlgorithm,
+			Type:         cert.Type,
+			Certificate:  newCert.Raw,
+			NotBefore:    newCert.NotBefore,
+			NotAfter:     newCert.NotAfter,
+			CreatedAt:    time.Now(),
+		}
+
+		if err := s.db.CreateCertificate(certModel); err != nil {
+			log.Printf("[AUTO-RENEW] Failed to save renewed cert: %v", err)
+			continue
+		}
+
+		// Enable auto-renew on new cert too
+		s.db.SetAutoRenew(certModel.ID, true)
+
+		// Log the renewal
+		s.db.AddAuditLog("auto_renew", "certificate", certModel.ID, "system",
+			fmt.Sprintf("Auto-renewed certificate %s (old: %s, new: %s)", cert.CommonName, cert.ID[:8], certModel.ID[:8]))
+
+		// Log notification
+		s.db.AddNotificationLog(&models.NotificationLog{
+			CertificateID:    &cert.ID,
+			NotificationType: "auto_renewed",
+			RecipientEmail:   "system",
+			Status:           "success",
+			SentAt:           time.Now(),
+		})
+
+		renewed++
+		log.Printf("[AUTO-RENEW] Renewed certificate: %s (new ID: %s)", cert.CommonName, certModel.ID[:8])
+	}
+
+	if renewed > 0 {
+		log.Printf("[AUTO-RENEW] Renewed %d certificates", renewed)
+	}
+	log.Println("Auto-renewal check completed")
 }
 
 func parseWarningDays(daysStr string) []int {

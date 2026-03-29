@@ -7,6 +7,7 @@ import (
 	"syscall"
 
 	"github.com/dachony/easyca/internal/api"
+	"github.com/dachony/easyca/internal/ca"
 	"github.com/dachony/easyca/internal/middleware"
 	"github.com/dachony/easyca/internal/scheduler"
 	"github.com/dachony/easyca/internal/smtp"
@@ -48,12 +49,18 @@ func main() {
 		c.Next()
 	})
 
-	handler := api.NewHandler(db, []byte(encryptionKey))
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = encryptionKey // fallback to encryption key
+	}
+
+	handler := api.NewHandler(db, []byte(encryptionKey), jwtSecret)
 	handler.RegisterRoutes(r)
 
 	// Initialize SMTP service and scheduler
 	smtpService := smtp.NewSMTPService([]byte(encryptionKey))
-	sched := scheduler.NewScheduler(db, smtpService)
+	caService := ca.NewCAService([]byte(encryptionKey))
+	sched := scheduler.NewScheduler(db, smtpService, caService)
 	sched.Start()
 
 	// Handle graceful shutdown

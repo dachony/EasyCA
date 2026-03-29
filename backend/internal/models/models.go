@@ -298,6 +298,56 @@ type SaveTimeSettingsRequest struct {
 	ManualTime string     `json:"manual_time,omitempty"`
 }
 
+// User & Auth Models
+type UserRole string
+
+const (
+	UserRoleAdmin    UserRole = "admin"
+	UserRoleOperator UserRole = "operator"
+	UserRoleViewer   UserRole = "viewer"
+)
+
+type User struct {
+	ID           string    `json:"id"`
+	Username     string    `json:"username"`
+	PasswordHash string    `json:"-"`
+	Role         UserRole  `json:"role"`
+	FullName     string    `json:"full_name"`
+	Email        string    `json:"email"`
+	Active       bool      `json:"active"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type RegisterRequest struct {
+	Username string `json:"username" binding:"required,min=3"`
+	Password string `json:"password" binding:"required,min=8"`
+	FullName string `json:"full_name"`
+	Email    string `json:"email"`
+}
+
+type LoginRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+type LoginResponse struct {
+	Token string `json:"token"`
+	User  User   `json:"user"`
+}
+
+type UpdateUserRequest struct {
+	Role     UserRole `json:"role"`
+	FullName string   `json:"full_name"`
+	Email    string   `json:"email"`
+	Active   *bool    `json:"active"`
+}
+
+type ChangePasswordRequest struct {
+	OldPassword string `json:"old_password" binding:"required"`
+	NewPassword string `json:"new_password" binding:"required,min=8"`
+}
+
 // Certificate Template Models
 type CertificateTemplate struct {
 	ID                 string             `json:"id"`
