@@ -38,6 +38,11 @@ func main() {
 	rateLimiter := middleware.NewRateLimiter(120, 30)
 	r.Use(rateLimiter.Middleware())
 
+	// Metrics
+	metrics := middleware.NewMetrics(db)
+	r.Use(metrics.Middleware())
+	r.GET("/metrics", metrics.Handler())
+
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")

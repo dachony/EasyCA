@@ -34,8 +34,14 @@ EasyCA/
 │   ├── internal/
 │   │   ├── api/
 │   │   │   └── handler.go       # HTTP handleri
+│   │   ├── auth/
+│   │   │   └── auth.go          # JWT auth, bcrypt password hashing
 │   │   ├── ca/
 │   │   │   └── ca.go            # CA operacije (kreiranje, potpisivanje)
+│   │   ├── middleware/
+│   │   │   ├── auth.go          # Auth & RBAC middleware
+│   │   │   ├── metrics.go       # Prometheus metrics middleware
+│   │   │   └── ratelimit.go     # Rate limiting middleware
 │   │   ├── models/
 │   │   │   └── models.go        # Data modeli
 │   │   └── storage/
@@ -46,10 +52,15 @@ EasyCA/
 │   │   ├── pages/
 │   │   │   ├── Dashboard.tsx    # Početna strana sa statistikama
 │   │   │   ├── CAs.tsx          # Upravljanje CA
-│   │   │   ├── Certificates.tsx # Upravljanje sertifikatima
+│   │   │   ├── Certificates.tsx # Upravljanje sertifikatima (bulk, auto-renew)
+│   │   │   ├── CSRs.tsx         # Certificate Signing Requests
+│   │   │   ├── Templates.tsx    # Certificate Templates
 │   │   │   ├── Tools.tsx        # Konverzije i import
 │   │   │   ├── Learn.tsx        # Edukativni sadržaj
-│   │   │   └── AuditLog.tsx     # Audit log pregled
+│   │   │   ├── AuditLog.tsx     # Audit log pregled
+│   │   │   ├── Login.tsx        # Login/Register stranica
+│   │   │   ├── Users.tsx        # User management (admin)
+│   │   │   └── Settings.tsx     # SMTP, notifikacije, backup
 │   │   ├── App.tsx              # Glavna komponenta + routing
 │   │   ├── main.tsx             # Entry point
 │   │   └── index.css            # Stilovi (light + dark tema)
@@ -121,11 +132,51 @@ GET  /api/certificates/:id/chain      - Download sa CA chain-om
 POST /api/certificates/:id/export/pkcs12 - Export kao PKCS12
 ```
 
+### Authentication
+```
+POST /api/auth/login           - Login (vraća JWT token)
+POST /api/auth/register        - Registracija (admin only posle prvog korisnika)
+GET  /api/auth/check           - Provera auth statusa
+GET  /api/auth/me              - Trenutni korisnik
+POST /api/auth/change-password - Promena lozinke
+```
+
+### User Management (admin only)
+```
+GET  /api/users                - Lista korisnika
+PUT  /api/users/:id            - Ažuriranje korisnika (role, active)
+DELETE /api/users/:id          - Brisanje korisnika
+```
+
+### Templates
+```
+POST /api/templates            - Kreiranje šablona
+GET  /api/templates            - Lista šablona
+GET  /api/templates/:id        - Detalji šablona
+PUT  /api/templates/:id        - Ažuriranje šablona
+DELETE /api/templates/:id      - Brisanje šablona
+```
+
+### Bulk Operations
+```
+POST /api/certificates/bulk/revoke  - Bulk revokacija
+POST /api/certificates/bulk/export  - Bulk export
+POST /api/certificates/bulk/delete  - Bulk brisanje (admin only)
+```
+
+### Auto-Renewal
+```
+POST /api/certificates/:id/auto-renew - Toggle auto-renewal
+GET  /api/certificates/:id/auto-renew - Status auto-renewal
+```
+
 ### Tools & PKI
 ```
 POST /api/convert              - Konverzija formata
 GET  /api/audit                - Audit log
 GET  /crl/:ca_id               - CRL za CA
+POST /ocsp/:ca_id              - OCSP responder
+GET  /metrics                  - Prometheus metrike
 GET  /health                   - Health check
 ```
 
@@ -246,16 +297,16 @@ npm run dev
 
 ## TODO / Buduće funkcionalnosti
 
-- [ ] OCSP responder
+- [x] OCSP responder - `POST /ocsp/:ca_id`
 - [ ] ACME protokol (Let's Encrypt kompatibilnost)
-- [ ] Auto-renewal sertifikata
-- [ ] User authentication
-- [ ] Role-based access control
-- [ ] Certificate templates
-- [ ] Email notifikacije za istek sertifikata
-- [ ] Bulk operacije
-- [ ] API rate limiting
-- [ ] Metrics/monitoring
+- [x] Auto-renewal sertifikata - automatski scheduler 30 dana pre isteka
+- [x] User authentication - JWT, login/register, default admin (admin/admin123)
+- [x] Role-based access control - admin/operator/viewer sa per-route permisijama
+- [x] Certificate templates - CRUD + frontend UI + "Use Template"
+- [x] Email notifikacije za istek/izdavanje/revokaciju sertifikata
+- [x] Bulk operacije - bulk revoke/export/delete
+- [x] API rate limiting - 120 req/min po IP, burst 30
+- [x] Metrics/monitoring - Prometheus format na `/metrics`
 
 ## Licenca
 

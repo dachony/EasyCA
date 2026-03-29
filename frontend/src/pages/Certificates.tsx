@@ -79,6 +79,8 @@ function Certificates() {
   const [deleteCert, setDeleteCert] = useState<Certificate | null>(null)
   const [deleteReason, setDeleteReason] = useState('')
   const [deleteConfirmation, setDeleteConfirmation] = useState('')
+  const [selectedCerts, setSelectedCerts] = useState<Set<string>>(new Set())
+  const [autoRenewMap, setAutoRenewMap] = useState<Record<string, boolean>>({})
 
   const fetchData = () => {
     Promise.all([
@@ -348,6 +350,65 @@ function Certificates() {
     return 'valid'
   }
 
+  const toggleSelectCert = (id: string) => {
+    setSelectedCerts(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const handleBulkRevoke = async () => {
+    if (selectedCerts.size === 0) return
+    if (!confirm(`Revoke ${selectedCerts.size} certificates?`)) return
+    try {
+      const res = await fetch('/api/certificates/bulk/revoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: Array.from(selectedCerts), reason: 'Bulk revocation' }),
+      })
+      if (!res.ok) throw new Error('Failed')
+      const data = await res.json()
+      setStatusWithAutoClear({ type: 'success', message: `Revoked ${data.revoked} certificates` })
+      setSelectedCerts(new Set())
+      fetchData()
+    } catch { setStatusWithAutoClear({ type: 'error', message: 'Bulk revoke failed' }) }
+  }
+
+  const handleBulkExport = async () => {
+    if (selectedCerts.size === 0) return
+    try {
+      const res = await fetch('/api/certificates/bulk/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: Array.from(selectedCerts), format: 'pem' }),
+      })
+      const data = await res.json()
+      const pemBundle = data.map((c: any) => `# ${c.common_name}\n${c.certificate_pem}`).join('\n\n')
+      const blob = new Blob([pemBundle], { type: 'application/x-pem-file' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `certificates-bundle-${selectedCerts.size}.pem`
+      a.click()
+      URL.revokeObjectURL(url)
+      setStatusWithAutoClear({ type: 'success', message: `Exported ${data.length} certificates` })
+    } catch { setStatusWithAutoClear({ type: 'error', message: 'Bulk export failed' }) }
+  }
+
+  const toggleAutoRenew = async (certId: string) => {
+    const current = autoRenewMap[certId] || false
+    try {
+      await fetch(`/api/certificates/${certId}/auto-renew`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !current }),
+      })
+      setAutoRenewMap(prev => ({ ...prev, [certId]: !current }))
+    } catch { /* ignore */ }
+  }
+
   const getCertificates = (caId: string) => {
     return certs.filter(c => {
       if (c.ca_id !== caId) return false
@@ -514,7 +575,13 @@ function Certificates() {
     <tr key={cert.id} className={getRowClass('cert')}>
       <td style={{ paddingLeft: `${level * 1.5 + 1}rem` }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-          <span style={{ width: '1.25rem' }} />
+          <input
+            type="checkbox"
+            checked={selectedCerts.has(cert.id)}
+            onChange={() => toggleSelectCert(cert.id)}
+            onClick={e => e.stopPropagation()}
+            style={{ cursor: 'pointer' }}
+          />
           <strong>{highlightMatch(cert.common_name)}</strong>
         </div>
       </td>
@@ -572,12 +639,22 @@ function Certificates() {
             <option value="pkcs12">P12</option>
           </select>
           {!cert.revoked_at && (
-            <button
-              className="btn btn-danger btn-sm"
-              onClick={() => handleRevoke(cert.id)}
-            >
-              Revoke
-            </button>
+            <>
+              <button
+                className="btn btn-danger btn-sm"
+                onClick={() => handleRevoke(cert.id)}
+              >
+                Revoke
+              </button>
+              <button
+                className={`btn btn-sm ${autoRenewMap[cert.id] ? 'btn-primary' : 'btn-secondary'}`}
+                onClick={() => toggleAutoRenew(cert.id)}
+                title={autoRenewMap[cert.id] ? 'Auto-renew enabled' : 'Enable auto-renew'}
+                style={{ fontSize: '0.7rem' }}
+              >
+                {autoRenewMap[cert.id] ? 'Auto' : 'Auto'}
+              </button>
+            </>
           )}
           <button
             className="btn btn-secondary btn-sm"
@@ -605,6 +682,14 @@ function Certificates() {
       <div className="card-header" style={{ marginBottom: '1rem' }}>
         <h1>Certificates</h1>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+          {selectedCerts.size > 0 && (
+            <>
+              <span style={{ fontSize: '0.85rem', color: 'var(--text-muted)' }}>{selectedCerts.size} selected</span>
+              <button className="btn btn-secondary btn-sm" onClick={handleBulkExport}>Export</button>
+              <button className="btn btn-danger btn-sm" onClick={handleBulkRevoke}>Revoke</button>
+              <button className="btn btn-secondary btn-sm" onClick={() => setSelectedCerts(new Set())}>Clear</button>
+            </>
+          )}
           <button className="btn btn-primary" onClick={() => setShowModal(true)} disabled={cas.length === 0}>
             Issue Certificate
           </button>
