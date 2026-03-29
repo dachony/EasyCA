@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"time"
@@ -27,11 +28,178 @@ type Handler struct {
 }
 
 func NewHandler(db *storage.Database, encryptionKey []byte) *Handler {
-	return &Handler{
+	h := &Handler{
 		db:          db,
 		caService:   ca.NewCAService(encryptionKey),
 		smtpService: smtp.NewSMTPService(encryptionKey),
 	}
+	h.configureTimeFunc()
+	return h
+}
+
+// configureTimeFunc reads time settings from DB and configures CAService's time function
+func (h *Handler) configureTimeFunc() {
+	settings, err := h.db.GetTimeSettings()
+	if err != nil || settings == nil {
+		return
+	}
+
+	switch settings.TimeSource {
+	case models.TimeSourceManual:
+		if settings.ManualTime != "" {
+			parsed, err := time.Parse(time.RFC3339, settings.ManualTime)
+			if err == nil {
+				h.caService.SetTimeFunc(func() time.Time {
+					return parsed
+				})
+				return
+			}
+		}
+	case models.TimeSourceHost:
+		if settings.Timezone != "" && settings.Timezone != "UTC" {
+			loc, err := time.LoadLocation(settings.Timezone)
+			if err == nil {
+				h.caService.SetTimeFunc(func() time.Time {
+					return time.Now().In(loc)
+				})
+				return
+			}
+		}
+	}
+	// Default: use system time (timeFunc stays nil)
+	h.caService.SetTimeFunc(nil)
+}
+
+// sendIssuanceNotification sends email notifications asynchronously when a certificate is issued
+func (h *Handler) sendIssuanceNotification(certID, caID, commonName, certType string, notAfter time.Time) {
+	go func() {
+		settings, err := h.db.GetNotificationSettings()
+		if err != nil || !settings.NotifyOnIssuance {
+			return
+		}
+
+		smtpConfig, err := h.db.GetSMTPConfig()
+		if err != nil || smtpConfig == nil || smtpConfig.Host == "" {
+			return
+		}
+
+		recipients, err := h.db.GetRecipientsForCertificate(certID, caID)
+		if err != nil || len(recipients) == 0 {
+			return
+		}
+
+		for _, r := range recipients {
+			err := h.smtpService.SendIssuanceNotification(smtpConfig, r.Email, commonName, certType, notAfter)
+			status := "success"
+			var errMsg *string
+			if err != nil {
+				status = "failed"
+				msg := err.Error()
+				errMsg = &msg
+				log.Printf("[SMTP] Failed to send issuance notification for %s to %s: %v", commonName, r.Email, err)
+			}
+			cID := certID
+			h.db.AddNotificationLog(&models.NotificationLog{
+				CertificateID:    &cID,
+				NotificationType: "issuance",
+				RecipientEmail:   r.Email,
+				Status:           status,
+				ErrorMessage:     errMsg,
+				SentAt:           time.Now(),
+			})
+		}
+	}()
+}
+
+// sendRevocationNotification sends email notifications asynchronously when a certificate is revoked
+func (h *Handler) sendRevocationNotification(certID, caID, commonName, reason string) {
+	go func() {
+		settings, err := h.db.GetNotificationSettings()
+		if err != nil || !settings.NotifyOnRevocation {
+			return
+		}
+
+		smtpConfig, err := h.db.GetSMTPConfig()
+		if err != nil || smtpConfig == nil || smtpConfig.Host == "" {
+			return
+		}
+
+		recipients, err := h.db.GetRecipientsForCertificate(certID, caID)
+		if err != nil || len(recipients) == 0 {
+			return
+		}
+
+		for _, r := range recipients {
+			err := h.smtpService.SendRevocationNotification(smtpConfig, r.Email, commonName, reason)
+			status := "success"
+			var errMsg *string
+			if err != nil {
+				status = "failed"
+				msg := err.Error()
+				errMsg = &msg
+				log.Printf("[SMTP] Failed to send revocation notification for %s to %s: %v", commonName, r.Email, err)
+			}
+			cID := certID
+			h.db.AddNotificationLog(&models.NotificationLog{
+				CertificateID:    &cID,
+				NotificationType: "revocation",
+				RecipientEmail:   r.Email,
+				Status:           status,
+				ErrorMessage:     errMsg,
+				SentAt:           time.Now(),
+			})
+		}
+	}()
+}
+
+// applyDefaultSettings fills in empty request fields from saved default settings
+func (h *Handler) applyDefaultsToSubject(subject *models.SubjectFields) {
+	defaults, err := h.db.GetDefaultSettings()
+	if err != nil || defaults == nil {
+		return
+	}
+	if subject.Organization == "" {
+		subject.Organization = defaults.Organization
+	}
+	if subject.OrganizationalUnit == "" {
+		subject.OrganizationalUnit = defaults.OrganizationalUnit
+	}
+	if subject.Country == "" {
+		subject.Country = defaults.Country
+	}
+	if subject.State == "" {
+		subject.State = defaults.State
+	}
+	if subject.Locality == "" {
+		subject.Locality = defaults.Locality
+	}
+}
+
+func (h *Handler) getDefaultKeyAlgorithm() models.KeyAlgorithm {
+	defaults, err := h.db.GetDefaultSettings()
+	if err != nil || defaults == nil || defaults.KeyAlgorithm == "" {
+		return ""
+	}
+	return defaults.KeyAlgorithm
+}
+
+func (h *Handler) getDefaultSignatureAlgorithm() models.SignatureAlgorithm {
+	defaults, err := h.db.GetDefaultSettings()
+	if err != nil || defaults == nil || defaults.SignatureAlgorithm == "" {
+		return ""
+	}
+	return defaults.SignatureAlgorithm
+}
+
+func (h *Handler) getDefaultValidityDays(forCA bool) int {
+	defaults, err := h.db.GetDefaultSettings()
+	if err != nil || defaults == nil {
+		return 0
+	}
+	if forCA {
+		return defaults.ValidityDaysCA
+	}
+	return defaults.ValidityDaysCert
 }
 
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
@@ -110,6 +278,20 @@ func (h *Handler) CreateRootCA(c *gin.Context) {
 		return
 	}
 
+	// Apply default settings for empty fields
+	h.applyDefaultsToSubject(&req.SubjectFields)
+	if req.KeyAlgorithm == "" {
+		req.KeyAlgorithm = h.getDefaultKeyAlgorithm()
+	}
+	if req.SignatureAlgorithm == "" {
+		req.SignatureAlgorithm = h.getDefaultSignatureAlgorithm()
+	}
+	if req.ValidityDays <= 0 {
+		if days := h.getDefaultValidityDays(true); days > 0 {
+			req.ValidityDays = days
+		}
+	}
+
 	cert, privateKey, err := h.caService.GenerateRootCA(&req)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -162,6 +344,20 @@ func (h *Handler) CreateIntermediateCA(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Apply default settings for empty fields
+	h.applyDefaultsToSubject(&req.SubjectFields)
+	if req.KeyAlgorithm == "" {
+		req.KeyAlgorithm = h.getDefaultKeyAlgorithm()
+	}
+	if req.SignatureAlgorithm == "" {
+		req.SignatureAlgorithm = h.getDefaultSignatureAlgorithm()
+	}
+	if req.ValidityDays <= 0 {
+		if days := h.getDefaultValidityDays(true); days > 0 {
+			req.ValidityDays = days
+		}
 	}
 
 	parentCA, err := h.db.GetCA(req.ParentID)
@@ -314,6 +510,20 @@ func (h *Handler) CreateCertificate(c *gin.Context) {
 		return
 	}
 
+	// Apply default settings for empty fields
+	h.applyDefaultsToSubject(&req.SubjectFields)
+	if req.KeyAlgorithm == "" {
+		req.KeyAlgorithm = h.getDefaultKeyAlgorithm()
+	}
+	if req.SignatureAlgorithm == "" {
+		req.SignatureAlgorithm = h.getDefaultSignatureAlgorithm()
+	}
+	if req.ValidityDays <= 0 {
+		if days := h.getDefaultValidityDays(false); days > 0 {
+			req.ValidityDays = days
+		}
+	}
+
 	caModel, err := h.db.GetCA(req.CAID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "CA not found"})
@@ -370,6 +580,8 @@ func (h *Handler) CreateCertificate(c *gin.Context) {
 
 	h.db.AddAuditLog("create_certificate", "certificate", certModel.ID, "",
 		fmt.Sprintf("Created %s certificate: %s", req.Type, req.CommonName))
+
+	h.sendIssuanceNotification(certModel.ID, req.CAID, req.CommonName, string(req.Type), cert.NotAfter)
 
 	response := gin.H{
 		"certificate":     certModel,
@@ -476,12 +688,21 @@ func (h *Handler) RevokeCertificate(c *gin.Context) {
 		reason = "unspecified"
 	}
 
+	// Get certificate info before revoking (for notification)
+	certModel, err := h.db.GetCertificate(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "certificate not found"})
+		return
+	}
+
 	if err := h.db.RevokeCertificate(id, reason); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	h.db.AddAuditLog("revoke_certificate", "certificate", id, "", fmt.Sprintf("Revoked certificate, reason: %s", reason))
+
+	h.sendRevocationNotification(id, certModel.CAID, certModel.CommonName, reason)
 
 	c.JSON(http.StatusOK, gin.H{"message": "certificate revoked"})
 }
@@ -1211,6 +1432,8 @@ func (h *Handler) SignCSR(c *gin.Context) {
 
 	h.db.AddAuditLog("sign_csr", "csr", id, "", fmt.Sprintf("Signed CSR %s, issued certificate %s", csrModel.Name, certModel.ID))
 
+	h.sendIssuanceNotification(certModel.ID, req.CAID, certModel.CommonName, string(req.Type), cert.NotAfter)
+
 	certModel.CertificatePEM = string(ca.CertToPEM(cert))
 	c.JSON(http.StatusOK, gin.H{
 		"certificate":     certModel,
@@ -1502,23 +1725,20 @@ func (h *Handler) SaveTimeSettings(c *gin.Context) {
 
 	h.db.AddAuditLog("update_time_settings", "settings", "", "", fmt.Sprintf("Updated time settings: source=%s", req.TimeSource))
 
+	// Reconfigure CA time function with new settings
+	h.configureTimeFunc()
+
 	c.JSON(http.StatusOK, gin.H{"message": "Time settings saved"})
 }
 
 func (h *Handler) GetCurrentTime(c *gin.Context) {
 	settings, _ := h.db.GetTimeSettings()
 
-	currentTime := time.Now()
+	currentTime := h.caService.Now()
 	source := "host"
 
 	if settings != nil {
 		source = string(settings.TimeSource)
-		if settings.Timezone != "" {
-			loc, err := time.LoadLocation(settings.Timezone)
-			if err == nil {
-				currentTime = currentTime.In(loc)
-			}
-		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{

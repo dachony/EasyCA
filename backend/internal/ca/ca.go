@@ -25,11 +25,30 @@ import (
 
 type CAService struct {
 	encryptionKey []byte
+	timeFunc      func() time.Time
 }
 
 func NewCAService(encryptionKey []byte) *CAService {
 	key := sha256.Sum256(encryptionKey)
 	return &CAService{encryptionKey: key[:]}
+}
+
+// SetTimeFunc sets a custom time function (used for time settings integration)
+func (s *CAService) SetTimeFunc(f func() time.Time) {
+	s.timeFunc = f
+}
+
+// Now returns the current time using the custom time function if set, otherwise time.Now()
+func (s *CAService) Now() time.Time {
+	if s.timeFunc != nil {
+		return s.timeFunc()
+	}
+	return time.Now()
+}
+
+// now is an internal alias for Now
+func (s *CAService) now() time.Time {
+	return s.Now()
 }
 
 // generatePrivateKey generates a private key based on the algorithm
@@ -121,8 +140,8 @@ func (s *CAService) GenerateRootCA(req *models.CreateRootCARequest) (*x509.Certi
 	template := &x509.Certificate{
 		SerialNumber:          serialNumber,
 		Subject:               buildPkixName(&req.SubjectFields),
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(0, 0, validityDays),
+		NotBefore:             s.now(),
+		NotAfter:              s.now().AddDate(0, 0, validityDays),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
@@ -168,8 +187,8 @@ func (s *CAService) GenerateIntermediateCA(req *models.CreateIntermediateCAReque
 	template := &x509.Certificate{
 		SerialNumber:          serialNumber,
 		Subject:               buildPkixName(&req.SubjectFields),
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(0, 0, validityDays),
+		NotBefore:             s.now(),
+		NotAfter:              s.now().AddDate(0, 0, validityDays),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
@@ -229,8 +248,8 @@ func (s *CAService) GenerateCertificate(req *models.CreateCertificateRequest, ca
 	template := &x509.Certificate{
 		SerialNumber:          serialNumber,
 		Subject:               buildPkixName(&req.SubjectFields),
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(0, 0, validityDays),
+		NotBefore:             s.now(),
+		NotAfter:              s.now().AddDate(0, 0, validityDays),
 		KeyUsage:              keyUsage,
 		ExtKeyUsage:           extKeyUsage,
 		BasicConstraintsValid: true,
@@ -272,9 +291,9 @@ func (s *CAService) GenerateCRL(caCert *x509.Certificate, caKey crypto.PrivateKe
 	}
 
 	crlTemplate := &x509.RevocationList{
-		Number:              big.NewInt(time.Now().Unix()),
-		ThisUpdate:          time.Now(),
-		NextUpdate:          time.Now().AddDate(0, 0, 7),
+		Number:              big.NewInt(s.now().Unix()),
+		ThisUpdate:          s.now(),
+		NextUpdate:          s.now().AddDate(0, 0, 7),
 		RevokedCertificates: revokedList,
 	}
 
@@ -589,8 +608,8 @@ func (s *CAService) SignCSR(csr *x509.CertificateRequest, req *models.SignCSRReq
 	template := &x509.Certificate{
 		SerialNumber:          serialNumber,
 		Subject:               csr.Subject,
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(0, 0, validityDays),
+		NotBefore:             s.now(),
+		NotAfter:              s.now().AddDate(0, 0, validityDays),
 		KeyUsage:              keyUsage,
 		ExtKeyUsage:           extKeyUsage,
 		BasicConstraintsValid: true,
