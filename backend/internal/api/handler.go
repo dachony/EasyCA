@@ -266,6 +266,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			protected.GET("/users", requireAdmin, h.ListUsers)
 			protected.PUT("/users/:id", requireAdmin, h.UpdateUser)
 			protected.DELETE("/users/:id", requireAdmin, h.DeleteUser)
+			protected.POST("/users/:id/reset-password", requireAdmin, h.ResetUserPassword)
 
 			// CA - viewers can read, operators+ can write
 			protected.GET("/ca", h.ListCAs)
@@ -565,11 +566,11 @@ func (h *Handler) UpdateUser(c *gin.Context) {
 	if req.Role != "" {
 		user.Role = req.Role
 	}
-	if req.FullName != "" {
-		user.FullName = req.FullName
+	if req.FullName != nil {
+		user.FullName = *req.FullName
 	}
-	if req.Email != "" {
-		user.Email = req.Email
+	if req.Email != nil {
+		user.Email = *req.Email
 	}
 	if req.Active != nil {
 		user.Active = *req.Active
@@ -614,6 +615,41 @@ func (h *Handler) DeleteUser(c *gin.Context) {
 		fmt.Sprintf("Deleted user: %s", user.Username))
 
 	c.JSON(http.StatusOK, gin.H{"message": "user deleted"})
+}
+
+func (h *Handler) ResetUserPassword(c *gin.Context) {
+	id := c.Param("id")
+
+	var req struct {
+		NewPassword string `json:"new_password" binding:"required,min=8"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 8 characters"})
+		return
+	}
+
+	user, err := h.db.GetUserByID(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	hash, err := auth.HashPassword(req.NewPassword)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to hash password"})
+		return
+	}
+
+	if err := h.db.UpdateUserPassword(id, hash); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update password"})
+		return
+	}
+
+	adminID, _ := c.Get("userID")
+	h.db.AddAuditLog("reset_password", "user", id, adminID.(string),
+		fmt.Sprintf("Password reset for user: %s", user.Username))
+
+	c.JSON(http.StatusOK, gin.H{"message": "password reset successfully"})
 }
 
 // Auto-Renew Handlers

@@ -338,8 +338,8 @@ type LoginResponse struct {
 
 type UpdateUserRequest struct {
 	Role     UserRole `json:"role"`
-	FullName string   `json:"full_name"`
-	Email    string   `json:"email"`
+	FullName *string  `json:"full_name"`
+	Email    *string  `json:"email"`
 	Active   *bool    `json:"active"`
 }
 
