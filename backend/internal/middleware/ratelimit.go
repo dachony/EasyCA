@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -91,6 +92,17 @@ func (rl *RateLimiter) SetRate(requestsPerMinute int, burst int) {
 func (rl *RateLimiter) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !rl.enabled {
+			c.Next()
+			return
+		}
+
+		// Exclude public PKI endpoints from rate limiting
+		path := c.Request.URL.Path
+		if path == "/health" || path == "/metrics" ||
+			strings.HasPrefix(path, "/crl/") ||
+			strings.HasPrefix(path, "/ocsp/") ||
+			strings.HasPrefix(path, "/acme/") ||
+			strings.HasPrefix(path, "/.well-known/") {
 			c.Next()
 			return
 		}

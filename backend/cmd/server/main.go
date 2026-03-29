@@ -35,8 +35,8 @@ func main() {
 
 	r := gin.Default()
 
-	// Rate limiting: 120 requests/minute per IP, burst of 30
-	rateLimiter := middleware.NewRateLimiter(120, 30)
+	// Rate limiting: 300 requests/minute per IP, burst of 60
+	rateLimiter := middleware.NewRateLimiter(300, 60)
 	r.Use(rateLimiter.Middleware())
 
 	// Metrics
