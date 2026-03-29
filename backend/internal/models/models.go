@@ -298,6 +298,42 @@ type SaveTimeSettingsRequest struct {
 	ManualTime string     `json:"manual_time,omitempty"`
 }
 
+// Certificate Template Models
+type CertificateTemplate struct {
+	ID                 string             `json:"id"`
+	Name               string             `json:"name"`
+	Description        string             `json:"description"`
+	Type               CertType           `json:"type"`
+	KeyAlgorithm       KeyAlgorithm       `json:"key_algorithm"`
+	SignatureAlgorithm SignatureAlgorithm `json:"signature_algorithm"`
+	ValidityDays       int                `json:"validity_days"`
+	Organization       string             `json:"organization"`
+	OrganizationalUnit string             `json:"organizational_unit"`
+	Country            string             `json:"country"`
+	State              string             `json:"state"`
+	Locality           string             `json:"locality"`
+	DNSNames           []string           `json:"dns_names"`
+	IPAddresses        []string           `json:"ip_addresses"`
+	CreatedAt          time.Time          `json:"created_at"`
+	UpdatedAt          time.Time          `json:"updated_at"`
+}
+
+type CreateTemplateRequest struct {
+	Name               string   `json:"name" binding:"required"`
+	Description        string   `json:"description"`
+	Type               CertType `json:"type" binding:"required"`
+	KeyAlgorithm       string   `json:"key_algorithm"`
+	SignatureAlgorithm string   `json:"signature_algorithm"`
+	ValidityDays       int      `json:"validity_days"`
+	Organization       string   `json:"organization"`
+	OrganizationalUnit string   `json:"organizational_unit"`
+	Country            string   `json:"country"`
+	State              string   `json:"state"`
+	Locality           string   `json:"locality"`
+	DNSNames           []string `json:"dns_names"`
+	IPAddresses        []string `json:"ip_addresses"`
+}
+
 // Backup Models
 type BackupData struct {
 	Version              string                        `json:"version"`

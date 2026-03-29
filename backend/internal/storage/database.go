@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dachony/easyca/internal/models"
@@ -187,6 +188,26 @@ func (d *Database) migrate() error {
 	-- Initialize time settings
 	INSERT OR IGNORE INTO time_settings (id, time_source, ntp_server, timezone)
 	VALUES (1, 'host', 'pool.ntp.org', 'UTC');
+
+	-- Certificate templates
+	CREATE TABLE IF NOT EXISTS certificate_templates (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		description TEXT DEFAULT '',
+		type TEXT NOT NULL,
+		key_algorithm TEXT DEFAULT 'rsa2048',
+		signature_algorithm TEXT DEFAULT 'sha256',
+		validity_days INTEGER DEFAULT 365,
+		organization TEXT DEFAULT '',
+		organizational_unit TEXT DEFAULT '',
+		country TEXT DEFAULT '',
+		state TEXT DEFAULT '',
+		locality TEXT DEFAULT '',
+		dns_names TEXT DEFAULT '',
+		ip_addresses TEXT DEFAULT '',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
 	`
 
 	_, err := d.db.Exec(schema)
@@ -1001,4 +1022,123 @@ func (d *Database) HasCertificates(id string) (bool, error) {
 		return false, err
 	}
 	return count > 0, nil
+}
+
+func (d *Database) GetCertificateBySerial(serialNumber string) (*models.Certificate, error) {
+	cert := &models.Certificate{}
+	var dnsNames, keyAlg, sigAlg sql.NullString
+	err := d.db.QueryRow(`
+		SELECT id, serial_number, ca_id, common_name, type, certificate,
+			not_before, not_after, revoked_at, revocation_reason, created_at,
+			organization, dns_names, key_algorithm, signature_algorithm
+		FROM certificates WHERE serial_number = ?`, serialNumber,
+	).Scan(&cert.ID, &cert.SerialNumber, &cert.CAID, &cert.CommonName, &cert.Type,
+		&cert.Certificate, &cert.NotBefore, &cert.NotAfter, &cert.RevokedAt,
+		&cert.RevocationReason, &cert.CreatedAt,
+		&cert.Organization, &dnsNames, &keyAlg, &sigAlg)
+	if err != nil {
+		return nil, err
+	}
+	if dnsNames.Valid && dnsNames.String != "" {
+		cert.DNSNames = strings.Split(dnsNames.String, ",")
+	}
+	if keyAlg.Valid {
+		cert.KeyAlgorithm = models.KeyAlgorithm(keyAlg.String)
+	}
+	if sigAlg.Valid {
+		cert.SignatureAlgorithm = models.SignatureAlgorithm(sigAlg.String)
+	}
+	return cert, nil
+}
+
+// Certificate Template Methods
+
+func (d *Database) CreateTemplate(t *models.CertificateTemplate) error {
+	dnsNames := strings.Join(t.DNSNames, ",")
+	ipAddresses := strings.Join(t.IPAddresses, ",")
+	_, err := d.db.Exec(`
+		INSERT INTO certificate_templates (id, name, description, type, key_algorithm, signature_algorithm,
+			validity_days, organization, organizational_unit, country, state, locality,
+			dns_names, ip_addresses, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		t.ID, t.Name, t.Description, t.Type, t.KeyAlgorithm, t.SignatureAlgorithm,
+		t.ValidityDays, t.Organization, t.OrganizationalUnit, t.Country, t.State, t.Locality,
+		dnsNames, ipAddresses, t.CreatedAt, t.UpdatedAt,
+	)
+	return err
+}
+
+func (d *Database) GetTemplate(id string) (*models.CertificateTemplate, error) {
+	t := &models.CertificateTemplate{}
+	var dnsNames, ipAddresses string
+	err := d.db.QueryRow(`
+		SELECT id, name, description, type, key_algorithm, signature_algorithm,
+			validity_days, organization, organizational_unit, country, state, locality,
+			dns_names, ip_addresses, created_at, updated_at
+		FROM certificate_templates WHERE id = ?`, id,
+	).Scan(&t.ID, &t.Name, &t.Description, &t.Type, &t.KeyAlgorithm, &t.SignatureAlgorithm,
+		&t.ValidityDays, &t.Organization, &t.OrganizationalUnit, &t.Country, &t.State, &t.Locality,
+		&dnsNames, &ipAddresses, &t.CreatedAt, &t.UpdatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if dnsNames != "" {
+		t.DNSNames = strings.Split(dnsNames, ",")
+	}
+	if ipAddresses != "" {
+		t.IPAddresses = strings.Split(ipAddresses, ",")
+	}
+	return t, nil
+}
+
+func (d *Database) ListTemplates() ([]models.CertificateTemplate, error) {
+	rows, err := d.db.Query(`
+		SELECT id, name, description, type, key_algorithm, signature_algorithm,
+			validity_days, organization, organizational_unit, country, state, locality,
+			dns_names, ip_addresses, created_at, updated_at
+		FROM certificate_templates ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var templates []models.CertificateTemplate
+	for rows.Next() {
+		t := models.CertificateTemplate{}
+		var dnsNames, ipAddresses string
+		if err := rows.Scan(&t.ID, &t.Name, &t.Description, &t.Type, &t.KeyAlgorithm, &t.SignatureAlgorithm,
+			&t.ValidityDays, &t.Organization, &t.OrganizationalUnit, &t.Country, &t.State, &t.Locality,
+			&dnsNames, &ipAddresses, &t.CreatedAt, &t.UpdatedAt); err != nil {
+			return nil, err
+		}
+		if dnsNames != "" {
+			t.DNSNames = strings.Split(dnsNames, ",")
+		}
+		if ipAddresses != "" {
+			t.IPAddresses = strings.Split(ipAddresses, ",")
+		}
+		templates = append(templates, t)
+	}
+	return templates, nil
+}
+
+func (d *Database) UpdateTemplate(t *models.CertificateTemplate) error {
+	dnsNames := strings.Join(t.DNSNames, ",")
+	ipAddresses := strings.Join(t.IPAddresses, ",")
+	_, err := d.db.Exec(`
+		UPDATE certificate_templates SET
+			name = ?, description = ?, type = ?, key_algorithm = ?, signature_algorithm = ?,
+			validity_days = ?, organization = ?, organizational_unit = ?, country = ?, state = ?,
+			locality = ?, dns_names = ?, ip_addresses = ?, updated_at = ?
+		WHERE id = ?`,
+		t.Name, t.Description, t.Type, t.KeyAlgorithm, t.SignatureAlgorithm,
+		t.ValidityDays, t.Organization, t.OrganizationalUnit, t.Country, t.State,
+		t.Locality, dnsNames, ipAddresses, t.UpdatedAt, t.ID,
+	)
+	return err
+}
+
+func (d *Database) DeleteTemplate(id string) error {
+	_, err := d.db.Exec(`DELETE FROM certificate_templates WHERE id = ?`, id)
+	return err
 }

@@ -7,6 +7,7 @@ import (
 	"syscall"
 
 	"github.com/dachony/easyca/internal/api"
+	"github.com/dachony/easyca/internal/middleware"
 	"github.com/dachony/easyca/internal/scheduler"
 	"github.com/dachony/easyca/internal/smtp"
 	"github.com/dachony/easyca/internal/storage"
@@ -31,6 +32,10 @@ func main() {
 	defer db.Close()
 
 	r := gin.Default()
+
+	// Rate limiting: 120 requests/minute per IP, burst of 30
+	rateLimiter := middleware.NewRateLimiter(120, 30)
+	r.Use(rateLimiter.Middleware())
 
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")

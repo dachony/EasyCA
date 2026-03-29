@@ -1,11 +1,13 @@
 package api
 
 import (
+	"crypto"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -18,6 +20,7 @@ import (
 	"github.com/dachony/easyca/internal/storage"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"golang.org/x/crypto/ocsp"
 	"software.sslmate.com/src/go-pkcs12"
 )
 
@@ -256,6 +259,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		api.POST("/convert", h.ConvertCertificate)
 		api.POST("/analyze", h.AnalyzeCertificate)
 
+		// Template endpoints
+		api.POST("/templates", h.CreateTemplate)
+		api.GET("/templates", h.ListTemplates)
+		api.GET("/templates/:id", h.GetTemplate)
+		api.PUT("/templates/:id", h.UpdateTemplate)
+		api.DELETE("/templates/:id", h.DeleteTemplate)
+
 		api.GET("/audit", h.GetAuditLogs)
 
 		// Backup endpoints
@@ -264,6 +274,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	}
 
 	r.GET("/crl/:ca_id", h.GetCRL)
+	r.POST("/ocsp/:ca_id", h.HandleOCSP)
 	r.GET("/health", h.HealthCheck)
 }
 
@@ -777,6 +788,95 @@ func (h *Handler) GetCRL(c *gin.Context) {
 
 	c.Header("Content-Type", "application/pkix-crl")
 	c.Data(http.StatusOK, "application/pkix-crl", crlPEM)
+}
+
+func (h *Handler) HandleOCSP(c *gin.Context) {
+	caID := c.Param("ca_id")
+
+	// Read OCSP request body
+	reqBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil || len(reqBytes) == 0 {
+		c.Data(http.StatusBadRequest, "application/ocsp-response", ocspMalformedResponse())
+		return
+	}
+
+	ocspReq, err := ocsp.ParseRequest(reqBytes)
+	if err != nil {
+		c.Data(http.StatusBadRequest, "application/ocsp-response", ocspMalformedResponse())
+		return
+	}
+
+	caModel, err := h.db.GetCA(caID)
+	if err != nil {
+		c.Data(http.StatusOK, "application/ocsp-response", ocspInternalErrorResponse())
+		return
+	}
+
+	caCert, err := parseRawCert(caModel.Certificate)
+	if err != nil {
+		c.Data(http.StatusOK, "application/ocsp-response", ocspInternalErrorResponse())
+		return
+	}
+
+	caKey, err := h.caService.DecryptPrivateKey(caModel.PrivateKeyEncrypted)
+	if err != nil {
+		c.Data(http.StatusOK, "application/ocsp-response", ocspInternalErrorResponse())
+		return
+	}
+
+	signer, ok := caKey.(crypto.Signer)
+	if !ok {
+		c.Data(http.StatusOK, "application/ocsp-response", ocspInternalErrorResponse())
+		return
+	}
+
+	// Find certificate by serial number
+	serialStr := ocspReq.SerialNumber.String()
+	cert, err := h.db.GetCertificateBySerial(serialStr)
+
+	now := h.caService.Now()
+	var status int
+	var revokedAt time.Time
+	var revocationReason int
+
+	if err != nil {
+		// Certificate not found - unknown status
+		status = ocsp.Unknown
+	} else if cert.RevokedAt != nil {
+		status = ocsp.Revoked
+		revokedAt = *cert.RevokedAt
+		revocationReason = ocsp.Unspecified
+	} else {
+		status = ocsp.Good
+	}
+
+	template := ocsp.Response{
+		Status:           status,
+		SerialNumber:     ocspReq.SerialNumber,
+		Certificate:      caCert,
+		ThisUpdate:       now,
+		NextUpdate:       now.Add(24 * time.Hour),
+		RevokedAt:        revokedAt,
+		RevocationReason: revocationReason,
+	}
+
+	responseBytes, err := ocsp.CreateResponse(caCert, caCert, template, signer)
+	if err != nil {
+		c.Data(http.StatusOK, "application/ocsp-response", ocspInternalErrorResponse())
+		return
+	}
+
+	c.Data(http.StatusOK, "application/ocsp-response", responseBytes)
+}
+
+func ocspMalformedResponse() []byte {
+	// OCSPResponseStatus malformedRequest (1)
+	return []byte{0x30, 0x03, 0x0a, 0x01, 0x01}
+}
+
+func ocspInternalErrorResponse() []byte {
+	// OCSPResponseStatus internalError (2)
+	return []byte{0x30, 0x03, 0x0a, 0x01, 0x02}
 }
 
 func (h *Handler) GetAuditLogs(c *gin.Context) {
@@ -1755,6 +1855,132 @@ func getFirst(slice []string) string {
 		return slice[0]
 	}
 	return ""
+}
+
+// Template Handlers
+
+func (h *Handler) CreateTemplate(c *gin.Context) {
+	var req models.CreateTemplateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	t := &models.CertificateTemplate{
+		ID:                 uuid.New().String(),
+		Name:               req.Name,
+		Description:        req.Description,
+		Type:               req.Type,
+		KeyAlgorithm:       models.KeyAlgorithm(req.KeyAlgorithm),
+		SignatureAlgorithm: models.SignatureAlgorithm(req.SignatureAlgorithm),
+		ValidityDays:       req.ValidityDays,
+		Organization:       req.Organization,
+		OrganizationalUnit: req.OrganizationalUnit,
+		Country:            req.Country,
+		State:              req.State,
+		Locality:           req.Locality,
+		DNSNames:           req.DNSNames,
+		IPAddresses:        req.IPAddresses,
+		CreatedAt:          time.Now(),
+		UpdatedAt:          time.Now(),
+	}
+
+	if t.ValidityDays <= 0 {
+		t.ValidityDays = 365
+	}
+	if t.KeyAlgorithm == "" {
+		t.KeyAlgorithm = models.KeyAlgorithmRSA2048
+	}
+	if t.SignatureAlgorithm == "" {
+		t.SignatureAlgorithm = models.SignatureAlgorithmSHA256
+	}
+
+	if err := h.db.CreateTemplate(t); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create template"})
+		return
+	}
+
+	h.db.AddAuditLog("create_template", "template", t.ID, "", fmt.Sprintf("Created template: %s", t.Name))
+	c.JSON(http.StatusCreated, t)
+}
+
+func (h *Handler) ListTemplates(c *gin.Context) {
+	templates, err := h.db.ListTemplates()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if templates == nil {
+		templates = []models.CertificateTemplate{}
+	}
+	c.JSON(http.StatusOK, templates)
+}
+
+func (h *Handler) GetTemplate(c *gin.Context) {
+	id := c.Param("id")
+	t, err := h.db.GetTemplate(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "template not found"})
+		return
+	}
+	c.JSON(http.StatusOK, t)
+}
+
+func (h *Handler) UpdateTemplate(c *gin.Context) {
+	id := c.Param("id")
+
+	existing, err := h.db.GetTemplate(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "template not found"})
+		return
+	}
+
+	var req models.CreateTemplateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	existing.Name = req.Name
+	existing.Description = req.Description
+	existing.Type = req.Type
+	existing.KeyAlgorithm = models.KeyAlgorithm(req.KeyAlgorithm)
+	existing.SignatureAlgorithm = models.SignatureAlgorithm(req.SignatureAlgorithm)
+	existing.ValidityDays = req.ValidityDays
+	existing.Organization = req.Organization
+	existing.OrganizationalUnit = req.OrganizationalUnit
+	existing.Country = req.Country
+	existing.State = req.State
+	existing.Locality = req.Locality
+	existing.DNSNames = req.DNSNames
+	existing.IPAddresses = req.IPAddresses
+	existing.UpdatedAt = time.Now()
+
+	if err := h.db.UpdateTemplate(existing); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update template"})
+		return
+	}
+
+	h.db.AddAuditLog("update_template", "template", id, "", fmt.Sprintf("Updated template: %s", existing.Name))
+	c.JSON(http.StatusOK, existing)
+}
+
+func (h *Handler) DeleteTemplate(c *gin.Context) {
+	id := c.Param("id")
+
+	t, err := h.db.GetTemplate(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "template not found"})
+		return
+	}
+
+	if err := h.db.DeleteTemplate(id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete template"})
+		return
+	}
+
+	h.db.AddAuditLog("delete_template", "template", id, "", fmt.Sprintf("Deleted template: %s", t.Name))
+	c.JSON(http.StatusOK, gin.H{"message": "template deleted"})
 }
 
 // Backup Handlers

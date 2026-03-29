@@ -93,6 +93,31 @@ function Certificates() {
 
   useEffect(() => {
     fetchData()
+
+    // Check for template from Templates page
+    const templateData = sessionStorage.getItem('certificate_template')
+    if (templateData) {
+      sessionStorage.removeItem('certificate_template')
+      try {
+        const t = JSON.parse(templateData)
+        setFormData(prev => ({
+          ...prev,
+          type: t.type || prev.type,
+          organization: t.organization || prev.organization,
+          organizational_unit: t.organizational_unit || prev.organizational_unit,
+          country: t.country || prev.country,
+          state: t.state || prev.state,
+          locality: t.locality || prev.locality,
+          key_algorithm: t.key_algorithm || prev.key_algorithm,
+          signature_algorithm: t.signature_algorithm || prev.signature_algorithm,
+          validity_days: t.validity_days || prev.validity_days,
+          dns_names: (t.dns_names || []).join(', '),
+          ip_addresses: (t.ip_addresses || []).join(', '),
+        }))
+        setShowModal(true)
+        setShowAdvanced(true)
+      } catch { /* ignore */ }
+    }
   }, [])
 
   const setStatusWithAutoClear = (status: FormStatus) => {

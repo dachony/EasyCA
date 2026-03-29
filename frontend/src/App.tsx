@@ -7,6 +7,7 @@ import CSRs from './pages/CSRs'
 import Tools from './pages/Tools'
 import Learn from './pages/Learn'
 import AuditLog from './pages/AuditLog'
+import Templates from './pages/Templates'
 import Settings from './pages/Settings'
 
 function App() {
@@ -29,6 +30,7 @@ function App() {
           <NavLink to="/cas" className={({ isActive }) => isActive ? 'active' : ''}>Certificate Authorities</NavLink>
           <NavLink to="/certificates" className={({ isActive }) => isActive ? 'active' : ''}>Certificates</NavLink>
           <NavLink to="/csrs" className={({ isActive }) => isActive ? 'active' : ''}>CSRs</NavLink>
+          <NavLink to="/templates" className={({ isActive }) => isActive ? 'active' : ''}>Templates</NavLink>
           <NavLink to="/tools" className={({ isActive }) => isActive ? 'active' : ''}>Tools</NavLink>
           <NavLink to="/learn" className={({ isActive }) => isActive ? 'active' : ''}>Learn</NavLink>
           <NavLink to="/audit" className={({ isActive }) => isActive ? 'active' : ''}>Audit Log</NavLink>
@@ -83,6 +85,7 @@ function App() {
           <Route path="/cas" element={<CAs />} />
           <Route path="/certificates" element={<Certificates />} />
           <Route path="/csrs" element={<CSRs />} />
+          <Route path="/templates" element={<Templates />} />
           <Route path="/tools" element={<Tools />} />
           <Route path="/learn" element={<Learn />} />
           <Route path="/audit" element={<AuditLog />} />
