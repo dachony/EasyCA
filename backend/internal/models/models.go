@@ -384,6 +384,85 @@ type CreateTemplateRequest struct {
 	IPAddresses        []string `json:"ip_addresses"`
 }
 
+// ACME Models (RFC 8555)
+type ACMEAccountStatus string
+
+const (
+	ACMEAccountValid       ACMEAccountStatus = "valid"
+	ACMEAccountDeactivated ACMEAccountStatus = "deactivated"
+)
+
+type ACMEOrderStatus string
+
+const (
+	ACMEOrderPending    ACMEOrderStatus = "pending"
+	ACMEOrderReady      ACMEOrderStatus = "ready"
+	ACMEOrderProcessing ACMEOrderStatus = "processing"
+	ACMEOrderValid      ACMEOrderStatus = "valid"
+	ACMEOrderInvalid    ACMEOrderStatus = "invalid"
+)
+
+type ACMEAuthzStatus string
+
+const (
+	ACMEAuthzPending ACMEAuthzStatus = "pending"
+	ACMEAuthzValid   ACMEAuthzStatus = "valid"
+	ACMEAuthzInvalid ACMEAuthzStatus = "invalid"
+)
+
+type ACMEChallengeStatus string
+
+const (
+	ACMEChallengePending    ACMEChallengeStatus = "pending"
+	ACMEChallengeProcessing ACMEChallengeStatus = "processing"
+	ACMEChallengeValid      ACMEChallengeStatus = "valid"
+	ACMEChallengeInvalid    ACMEChallengeStatus = "invalid"
+)
+
+type ACMEAccount struct {
+	ID        string            `json:"id"`
+	Key       string            `json:"key"`
+	Contact   []string          `json:"contact"`
+	Status    ACMEAccountStatus `json:"status"`
+	CreatedAt time.Time         `json:"created_at"`
+}
+
+type ACMEOrder struct {
+	ID            string          `json:"id"`
+	AccountID     string          `json:"account_id"`
+	Status        ACMEOrderStatus `json:"status"`
+	Identifiers   []ACMEIdentifier `json:"identifiers"`
+	NotBefore     *time.Time      `json:"notBefore,omitempty"`
+	NotAfter      *time.Time      `json:"notAfter,omitempty"`
+	Expires       time.Time       `json:"expires"`
+	CertificateID *string         `json:"certificate_id,omitempty"`
+	CAID          string          `json:"ca_id"`
+	CreatedAt     time.Time       `json:"created_at"`
+}
+
+type ACMEIdentifier struct {
+	Type  string `json:"type"`
+	Value string `json:"value"`
+}
+
+type ACMEAuthorization struct {
+	ID         string          `json:"id"`
+	OrderID    string          `json:"order_id"`
+	Identifier ACMEIdentifier  `json:"identifier"`
+	Status     ACMEAuthzStatus `json:"status"`
+	Expires    time.Time       `json:"expires"`
+	Token      string          `json:"token"`
+}
+
+type ACMEChallenge struct {
+	ID              string              `json:"id"`
+	AuthorizationID string              `json:"authorization_id"`
+	Type            string              `json:"type"`
+	Status          ACMEChallengeStatus `json:"status"`
+	Token           string              `json:"token"`
+	Validated       *time.Time          `json:"validated,omitempty"`
+}
+
 // Backup Models
 type BackupData struct {
 	Version              string                        `json:"version"`

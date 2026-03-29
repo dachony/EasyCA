@@ -189,6 +189,50 @@ func (d *Database) migrate() error {
 	INSERT OR IGNORE INTO time_settings (id, time_source, ntp_server, timezone)
 	VALUES (1, 'host', 'pool.ntp.org', 'UTC');
 
+	-- ACME tables
+	CREATE TABLE IF NOT EXISTS acme_accounts (
+		id TEXT PRIMARY KEY,
+		key_thumbprint TEXT UNIQUE NOT NULL,
+		contact TEXT DEFAULT '',
+		status TEXT DEFAULT 'valid',
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS acme_orders (
+		id TEXT PRIMARY KEY,
+		account_id TEXT NOT NULL,
+		status TEXT DEFAULT 'pending',
+		identifiers TEXT NOT NULL,
+		expires DATETIME,
+		certificate_id TEXT,
+		ca_id TEXT NOT NULL,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS acme_authorizations (
+		id TEXT PRIMARY KEY,
+		order_id TEXT NOT NULL,
+		identifier_type TEXT NOT NULL,
+		identifier_value TEXT NOT NULL,
+		status TEXT DEFAULT 'pending',
+		expires DATETIME,
+		token TEXT NOT NULL
+	);
+
+	CREATE TABLE IF NOT EXISTS acme_challenges (
+		id TEXT PRIMARY KEY,
+		authorization_id TEXT NOT NULL,
+		type TEXT NOT NULL,
+		status TEXT DEFAULT 'pending',
+		token TEXT NOT NULL,
+		validated DATETIME
+	);
+
+	CREATE TABLE IF NOT EXISTS acme_nonces (
+		nonce TEXT PRIMARY KEY,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
 	-- Auto-renewal settings
 	CREATE TABLE IF NOT EXISTS auto_renew (
 		certificate_id TEXT PRIMARY KEY,
@@ -1272,4 +1316,172 @@ func (d *Database) SetAutoRenew(certID string, enabled bool) error {
 
 func (d *Database) GetAutoRenewStatus(certID string) bool {
 	return d.IsAutoRenewEnabled(certID)
+}
+
+// ACME Methods
+
+func (d *Database) CreateACMENonce(nonce string) error {
+	_, err := d.db.Exec(`INSERT INTO acme_nonces (nonce) VALUES (?)`, nonce)
+	return err
+}
+
+func (d *Database) UseACMENonce(nonce string) bool {
+	result, err := d.db.Exec(`DELETE FROM acme_nonces WHERE nonce = ?`, nonce)
+	if err != nil {
+		return false
+	}
+	rows, _ := result.RowsAffected()
+	return rows > 0
+}
+
+func (d *Database) CreateACMEAccount(id, keyThumbprint, contact string) error {
+	_, err := d.db.Exec(`INSERT INTO acme_accounts (id, key_thumbprint, contact) VALUES (?, ?, ?)`,
+		id, keyThumbprint, contact)
+	return err
+}
+
+type ACMEAccountRow struct {
+	ID      string
+	Key     string
+	Contact []string
+	Status  string
+}
+
+func (d *Database) GetACMEAccountByKey(keyThumbprint string) (*ACMEAccountRow, error) {
+	a := &ACMEAccountRow{}
+	var contact string
+	err := d.db.QueryRow(`SELECT id, key_thumbprint, contact, status FROM acme_accounts WHERE key_thumbprint = ?`,
+		keyThumbprint).Scan(&a.ID, &a.Key, &contact, &a.Status)
+	if err != nil {
+		return nil, err
+	}
+	if contact != "" {
+		a.Contact = strings.Split(contact, ",")
+	}
+	return a, nil
+}
+
+type ACMEOrderRow struct {
+	ID            string
+	AccountID     string
+	Status        string
+	Identifiers   string
+	Expires       time.Time
+	CertificateID *string
+	CAID          string
+}
+
+func (d *Database) CreateACMEOrder(id, accountID, status, identifiers string, expires time.Time, caID string) error {
+	_, err := d.db.Exec(`INSERT INTO acme_orders (id, account_id, status, identifiers, expires, ca_id) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, accountID, status, identifiers, expires, caID)
+	return err
+}
+
+func (d *Database) GetACMEOrder(id string) (*ACMEOrderRow, error) {
+	o := &ACMEOrderRow{}
+	err := d.db.QueryRow(`SELECT id, account_id, status, identifiers, expires, certificate_id, ca_id FROM acme_orders WHERE id = ?`, id).
+		Scan(&o.ID, &o.AccountID, &o.Status, &o.Identifiers, &o.Expires, &o.CertificateID, &o.CAID)
+	return o, err
+}
+
+func (d *Database) UpdateACMEOrderStatus(id, status string) error {
+	_, err := d.db.Exec(`UPDATE acme_orders SET status = ? WHERE id = ?`, status, id)
+	return err
+}
+
+func (d *Database) UpdateACMEOrderCertificate(id, certID string) error {
+	_, err := d.db.Exec(`UPDATE acme_orders SET certificate_id = ? WHERE id = ?`, certID, id)
+	return err
+}
+
+type ACMEAuthzRow struct {
+	ID              string
+	OrderID         string
+	IdentifierType  string
+	IdentifierValue string
+	Status          string
+	Expires         time.Time
+	Token           string
+}
+
+func (d *Database) CreateACMEAuthorization(id, orderID, identType, identValue string, expires time.Time, token string) error {
+	_, err := d.db.Exec(`INSERT INTO acme_authorizations (id, order_id, identifier_type, identifier_value, status, expires, token)
+		VALUES (?, ?, ?, ?, 'pending', ?, ?)`, id, orderID, identType, identValue, expires, token)
+	return err
+}
+
+func (d *Database) GetACMEAuthorization(id string) (*ACMEAuthzRow, error) {
+	a := &ACMEAuthzRow{}
+	err := d.db.QueryRow(`SELECT id, order_id, identifier_type, identifier_value, status, expires, token FROM acme_authorizations WHERE id = ?`, id).
+		Scan(&a.ID, &a.OrderID, &a.IdentifierType, &a.IdentifierValue, &a.Status, &a.Expires, &a.Token)
+	return a, err
+}
+
+func (d *Database) GetACMEAuthorizationsByOrder(orderID string) ([]ACMEAuthzRow, error) {
+	rows, err := d.db.Query(`SELECT id, order_id, identifier_type, identifier_value, status, expires, token FROM acme_authorizations WHERE order_id = ?`, orderID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var authzs []ACMEAuthzRow
+	for rows.Next() {
+		a := ACMEAuthzRow{}
+		rows.Scan(&a.ID, &a.OrderID, &a.IdentifierType, &a.IdentifierValue, &a.Status, &a.Expires, &a.Token)
+		authzs = append(authzs, a)
+	}
+	return authzs, nil
+}
+
+func (d *Database) UpdateACMEAuthorizationStatus(id, status string) error {
+	_, err := d.db.Exec(`UPDATE acme_authorizations SET status = ? WHERE id = ?`, status, id)
+	return err
+}
+
+type ACMEChallengeRow struct {
+	ID              string
+	AuthorizationID string
+	Type            string
+	Status          string
+	Token           string
+	Validated       *time.Time
+}
+
+func (d *Database) CreateACMEChallenge(id, authzID, challType, token string) error {
+	_, err := d.db.Exec(`INSERT INTO acme_challenges (id, authorization_id, type, token) VALUES (?, ?, ?, ?)`,
+		id, authzID, challType, token)
+	return err
+}
+
+func (d *Database) GetACMEChallenge(id string) (*ACMEChallengeRow, error) {
+	ch := &ACMEChallengeRow{}
+	err := d.db.QueryRow(`SELECT id, authorization_id, type, status, token, validated FROM acme_challenges WHERE id = ?`, id).
+		Scan(&ch.ID, &ch.AuthorizationID, &ch.Type, &ch.Status, &ch.Token, &ch.Validated)
+	return ch, err
+}
+
+func (d *Database) GetACMEChallengesByAuthz(authzID string) ([]ACMEChallengeRow, error) {
+	rows, err := d.db.Query(`SELECT id, authorization_id, type, status, token, validated FROM acme_challenges WHERE authorization_id = ?`, authzID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var chs []ACMEChallengeRow
+	for rows.Next() {
+		ch := ACMEChallengeRow{}
+		rows.Scan(&ch.ID, &ch.AuthorizationID, &ch.Type, &ch.Status, &ch.Token, &ch.Validated)
+		chs = append(chs, ch)
+	}
+	return chs, nil
+}
+
+func (d *Database) GetACMEChallengeByToken(token string) (*ACMEChallengeRow, error) {
+	ch := &ACMEChallengeRow{}
+	err := d.db.QueryRow(`SELECT id, authorization_id, type, status, token, validated FROM acme_challenges WHERE token = ?`, token).
+		Scan(&ch.ID, &ch.AuthorizationID, &ch.Type, &ch.Status, &ch.Token, &ch.Validated)
+	return ch, err
+}
+
+func (d *Database) UpdateACMEChallengeStatus(id, status string, validated *time.Time) error {
+	_, err := d.db.Exec(`UPDATE acme_challenges SET status = ?, validated = ? WHERE id = ?`, status, validated, id)
+	return err
 }

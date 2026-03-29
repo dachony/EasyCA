@@ -325,6 +325,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			// Tools
 			protected.POST("/convert", h.ConvertCertificate)
 			protected.POST("/analyze", h.AnalyzeCertificate)
+			protected.GET("/certificates/:id/verify", h.VerifyCertificateChain)
 
 			// Templates
 			protected.GET("/templates", h.ListTemplates)
@@ -749,6 +750,109 @@ func (h *Handler) BulkDeleteCertificates(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"deleted": deleted, "failed": failed})
+}
+
+// Chain Verification Handler
+
+func (h *Handler) VerifyCertificateChain(c *gin.Context) {
+	id := c.Param("id")
+
+	certModel, err := h.db.GetCertificate(id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "certificate not found"})
+		return
+	}
+
+	cert, err := parseRawCert(certModel.Certificate)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to parse certificate"})
+		return
+	}
+
+	// Build chain
+	var chain []gin.H
+	chain = append(chain, gin.H{
+		"subject":    cert.Subject.CommonName,
+		"issuer":     cert.Issuer.CommonName,
+		"serial":     cert.SerialNumber.String(),
+		"not_before": cert.NotBefore,
+		"not_after":  cert.NotAfter,
+		"is_ca":      cert.IsCA,
+		"level":      0,
+	})
+
+	// Walk up the CA chain
+	caID := certModel.CAID
+	level := 1
+	valid := true
+	var errors []string
+
+	for caID != "" {
+		caModel, err := h.db.GetCA(caID)
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("CA %s not found in chain", caID))
+			valid = false
+			break
+		}
+
+		caCert, err := parseRawCert(caModel.Certificate)
+		if err != nil {
+			errors = append(errors, "Failed to parse CA certificate")
+			valid = false
+			break
+		}
+
+		chain = append(chain, gin.H{
+			"subject":    caCert.Subject.CommonName,
+			"issuer":     caCert.Issuer.CommonName,
+			"serial":     caCert.SerialNumber.String(),
+			"not_before": caCert.NotBefore,
+			"not_after":  caCert.NotAfter,
+			"is_ca":      true,
+			"type":       caModel.Type,
+			"level":      level,
+		})
+
+		// Verify signature
+		if level == 1 {
+			err = cert.CheckSignatureFrom(caCert)
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("Signature verification failed: %v", err))
+				valid = false
+			}
+		}
+
+		// Check expiry
+		now := time.Now()
+		if now.After(caCert.NotAfter) {
+			errors = append(errors, fmt.Sprintf("CA %s has expired", caCert.Subject.CommonName))
+			valid = false
+		}
+
+		if caModel.ParentID != nil {
+			caID = *caModel.ParentID
+		} else {
+			caID = ""
+		}
+		level++
+	}
+
+	// Check cert expiry
+	now := time.Now()
+	if now.After(cert.NotAfter) {
+		errors = append(errors, "Certificate has expired")
+		valid = false
+	}
+	if certModel.RevokedAt != nil {
+		errors = append(errors, "Certificate has been revoked")
+		valid = false
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"valid":  valid,
+		"chain":  chain,
+		"errors": errors,
+	})
 }
 
 func (h *Handler) CreateRootCA(c *gin.Context) {

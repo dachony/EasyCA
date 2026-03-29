@@ -298,7 +298,7 @@ npm run dev
 ## TODO / Buduće funkcionalnosti
 
 - [x] OCSP responder - `POST /ocsp/:ca_id`
-- [ ] ACME protokol (Let's Encrypt kompatibilnost)
+- [x] ACME protokol - `/acme/directory`, account, order, authz, challenge, finalize
 - [x] Auto-renewal sertifikata - automatski scheduler 30 dana pre isteka
 - [x] User authentication - JWT, login/register, default admin (admin/admin123)
 - [x] Role-based access control - admin/operator/viewer sa per-route permisijama

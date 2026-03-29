@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/dachony/easyca/internal/acme"
 	"github.com/dachony/easyca/internal/api"
 	"github.com/dachony/easyca/internal/ca"
 	"github.com/dachony/easyca/internal/middleware"
@@ -62,9 +63,23 @@ func main() {
 	handler := api.NewHandler(db, []byte(encryptionKey), jwtSecret)
 	handler.RegisterRoutes(r)
 
-	// Initialize SMTP service and scheduler
+	// Initialize services
 	smtpService := smtp.NewSMTPService([]byte(encryptionKey))
 	caService := ca.NewCAService([]byte(encryptionKey))
+
+	// ACME server
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8443"
+	}
+	acmeBaseURL := os.Getenv("ACME_BASE_URL")
+	if acmeBaseURL == "" {
+		acmeBaseURL = "http://localhost:" + port
+	}
+	acmeHandler := acme.NewACMEHandler(db, caService, acmeBaseURL)
+	acmeHandler.RegisterRoutes(r)
+
+	// Start scheduler
 	sched := scheduler.NewScheduler(db, smtpService, caService)
 	sched.Start()
 
@@ -78,11 +93,6 @@ func main() {
 		db.Close()
 		os.Exit(0)
 	}()
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8443"
-	}
 
 	log.Printf("Starting EasyCA server on port %s", port)
 	if err := r.Run(":" + port); err != nil {
